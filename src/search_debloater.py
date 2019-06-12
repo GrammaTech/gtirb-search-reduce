@@ -1,9 +1,29 @@
 #!/usr/bin/env python3
+# Large parts copied from block_remove.py in the rewriting/gtirb-reduce repo
+
 import argparse
 import sys
 import os
 import pprint
 from gtirb import *
+
+
+def print_graph(graph):
+    for entry, value in graph.items():
+        def print_edges(direction):
+            for node, edges in value[direction].items():
+                edges = str([(hex(e._source_block._address),
+                              hex(e._target_block._address))
+                             for e in edges])
+                print(f"\t{direction.upper()}: {node._address} | "
+                      f"EDGES: {edges}")
+        try:
+            print(f"NODE: {entry._address}")
+            for direction in ['to', 'from']:
+                print_edges(direction)
+        except Exception as e:
+            pass
+        print()
 
 
 def main():
