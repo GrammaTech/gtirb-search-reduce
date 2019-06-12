@@ -26,7 +26,12 @@ def main():
     ir_loader = IRLoader()
     ir = ir_loader.IRLoadFromProtobufFileName(infile)
     factory = ir_loader._factory
-    IRPrintString(infile)
+    # IRPrintString(infile)
+
+    ir_out = ir.toProtobuf()
+    with open(args.out, 'wb') as outfile:
+        outfile.write(ir_out.SerializeToString())
+
 
 if __name__ == '__main__':
     main()
