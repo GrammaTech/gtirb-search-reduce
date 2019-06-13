@@ -8,6 +8,9 @@ import pprint
 from gtirb import *
 
 
+verbosity = 0
+
+
 def add_edge(graph, source, target, edge):
     source_entry = graph.get(source)
     if source_entry is not None:
@@ -69,8 +72,9 @@ def remove_blocks(ir, factory, block_addresses=list()):
             if hasattr(block, '_address'):
                 blocks_by_addr[block._address] = block
 
-        print("Removing blocks "
-              f"{' '.join([f'{b:x}' for b in block_addresses])}")
+        if verbosity > 1:
+            print("Removing blocks "
+                  f"{' '.join([f'{b:x}' for b in block_addresses])}")
         # Add CFG edges to graph
         for edge in cfg._edges:
             add_edge(graph, edge.source(), edge.target(), edge)
@@ -90,9 +94,11 @@ def remove_blocks(ir, factory, block_addresses=list()):
             target = edge_removed.target()
             t_addr = target._address
             if (target in blocks_removed and source not in blocks_removed):
-                print(f"WARNING: {t_addr:x} removed,"
-                      f" but {s_addr:x} references it")
-            print(f"MESSAGE: removed edge {s_addr:x} -> {t_addr:x}")
+                if verbosity > 0:
+                    print(f"WARNING: {t_addr:x} removed,"
+                          f" but {s_addr:x} references it")
+            if verbosity > 1:
+                print(f"MESSAGE: removed edge {s_addr:x} -> {t_addr:x}")
 
         symbols_to_remove = list()
         for symbol in module.symbols():
@@ -155,18 +161,24 @@ def print_graph(graph):
 
 
 def main():
+    global verbosity
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--input",
-                        help="The input GTIRB file",
+                        help="input GTIRB file",
                         action='store',
                         required=True)
     parser.add_argument("-o", "--out",
-                        help="The output GTIRB file",
+                        help="output GTIRB file",
                         action='store',
                         default='out.ir')
+    parser.add_argument("-v", "--verbose",
+                        help="verbosity level",
+                        action='count',
+                        default=0)
     args = parser.parse_args()
 
     infile = args.input
+    verbosity = args.verbose
     if not os.path.exists(infile):
         print(f"Error: Input file {infile} does not exist.", file=sys.stderr)
         return -1
