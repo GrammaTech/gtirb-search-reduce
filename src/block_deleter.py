@@ -154,3 +154,11 @@ def print_graph(graph):
         except Exception as e:
             pass
         print()
+
+
+def block_addresses(ir):
+    blocks = list()
+    for module in ir._modules:
+        blocks += [b._address for b in module._blocks
+                   if hasattr(b, '_address')]
+    return blocks
