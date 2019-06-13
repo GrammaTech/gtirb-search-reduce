@@ -311,8 +311,8 @@ class DD:
                 print(len(cs[i]), end='')
             print()
 
-            c_failed = 0
-            cbar_failed = 0
+            c_failed = False
+            cbar_failed = False
 
             next_c = c[:]
             next_n = n
@@ -330,7 +330,7 @@ class DD:
                         print(f"dd: found {len(cs[i])} deltas:")
                         print(self.pretty(cs[i]))
 
-                    c_failed = 1
+                    c_failed = True
                     next_c = cs[i]
                     next_n = 2
                     cbar_offset = 0
@@ -358,7 +358,7 @@ class DD:
                             print("deltas:")
                             print(self.pretty(cbars[i]))
 
-                        cbar_failed = 1
+                        cbar_failed = True
                         next_c = listintersect(next_c, cbars[i])
                         next_n = next_n - 1
                         self.report_progress(next_c, "dd")
@@ -382,13 +382,13 @@ class DD:
             run = run + 1
 
     def ddmin(self, c):
-        return self.ddgen(c, 1, 0)
+        return self.ddgen(c, minimize=True, maximize=False)
 
     def ddmax(self, c):
-        return self.ddgen(c, 0, 1)
+        return self.ddgen(c, minimize=False, maximize=True)
 
     def ddmix(self, c):
-        return self.ddgen(c, 1, 1)
+        return self.ddgen(c, minimize=True, maximize=True)
 
     # General delta debugging (new TSE version)
     def dddiff(self, c):
@@ -441,7 +441,7 @@ class DD:
                 print(len(cs[i]), end='')
             print()
 
-            progress = 0
+            progress = False
 
             next_c1 = c1[:]
             next_c2 = c2[:]
@@ -459,7 +459,7 @@ class DD:
 
                 if t == Result.FAIL and t1 == Result.PASS:
                     # Found
-                    progress = 1
+                    progress = True
                     next_c2 = csub
                     next_n = 2
                     cbar_offset = 0
@@ -471,7 +471,7 @@ class DD:
 
                 if t == Result.PASS and t2 == Result.FAIL:
                     # Reduce to complement
-                    progress = 1
+                    progress = True
                     next_c1 = csub
                     next_n = max(next_n - 1, 2)
                     cbar_offset = i
@@ -487,7 +487,7 @@ class DD:
 
                 if t == Result.PASS and t2 == Result.FAIL:
                     # Found
-                    progress = 1
+                    progress = True
                     next_c1 = csub
                     next_n = 2
                     cbar_offset = 0
@@ -499,7 +499,7 @@ class DD:
 
                 if t == Result.FAIL and t1 == Result.PASS:
                     # Increase
-                    progress = 1
+                    progress = True
                     next_c2 = csub
                     next_n = max(next_n - 1, 2)
                     cbar_offset = i
