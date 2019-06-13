@@ -68,7 +68,7 @@ def remove_blocks(ir, factory, block_addresses=list(), verbosity=0):
             if hasattr(block, '_address'):
                 blocks_by_addr[block._address] = block
 
-        if verbosity > 1:
+        if verbosity > 2:
             print("Removing blocks "
                   f"{' '.join([f'{b:x}' for b in block_addresses])}")
         # Add CFG edges to graph
@@ -84,17 +84,19 @@ def remove_blocks(ir, factory, block_addresses=list(), verbosity=0):
             blocks_removed.append(blocks_by_addr[b])
             edges_removed.update(set(remove_node(graph, blocks_by_addr[b])))
 
-        for edge_removed in edges_removed:
-            source = edge_removed.source()
-            s_addr = source._address
-            target = edge_removed.target()
-            t_addr = target._address
-            if (target in blocks_removed and source not in blocks_removed):
-                if verbosity > 0:
-                    print(f"WARNING: {t_addr:x} removed,"
-                          f" but {s_addr:x} references it")
-            if verbosity > 1:
-                print(f"MESSAGE: removed edge {s_addr:x} -> {t_addr:x}")
+        if verbosity > 1:
+            for edge_removed in edges_removed:
+                source = edge_removed.source()
+                s_addr = source._address
+                target = edge_removed.target()
+                if isinstance(target, ProxyBlock):
+                    continue
+                t_addr = target._address
+                if (target in blocks_removed and source not in blocks_removed):
+                        print(f"WARNING: {t_addr:x} removed,"
+                              f" but {s_addr:x} references it")
+                if verbosity > 2:
+                    print(f"MESSAGE: removed edge {s_addr:x} -> {t_addr:x}")
 
         symbols_to_remove = list()
         for symbol in module.symbols():

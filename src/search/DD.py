@@ -52,22 +52,22 @@ class Result(Enum):
 
 
 # Helpers
-def listminus(self, list1, list2):
+def listminus(list1, list2):
     """Return a list of all elements of list1 that are not in list2."""
     return list(set([item for item in list1 if item not in list2]))
 
 
-def listintersect(self, list1, list2):
+def listintersect(list1, list2):
     """Return the common elements of list1 and list2."""
     return list(set([item for item in list1 if item in list2]))
 
 
-def listunion(self, list1, list2):
+def listunion(list1, list2):
     """Return the union of list1 and list2."""
     return list(set(list1 + list2))
 
 
-def listsubseteq(self, list1, list2):
+def listsubseteq(list1, list2):
     """Test if list1 is a subset or equal to list2."""
     return set(list1).issubset(set(list2))
 
