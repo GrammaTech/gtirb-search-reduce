@@ -1,8 +1,10 @@
 #! /usr/bin/env python3
 
 # Enhanced Delta Debugging class
-# Updated to Python 3 by Jeremy Lacomis, 2019
-
+# Updated to Python 3.6 by Jeremy Lacomis, 2019
+# The original code targeted Python 1.6 (!) which did not have many modern
+# Python features (e.g., booleans). Poor choices in this code (e.g., the use of
+# lists instead of sets) are likely artifacts of the original.
 
 # Original comment by Andreas:
 # Copyright (c) 1999, 2000, 2001 Andreas Zeller.
@@ -41,13 +43,33 @@
 
 from enum import Enum, auto
 from functools import lru_cache
-# import resource
 
 
 class Result(Enum):
     PASS = auto()
     FAIL = auto()
     UNRESOLVED = auto()
+
+
+# Helpers
+def listminus(self, list1, list2):
+    """Return a list of all elements of list1 that are not in list2."""
+    return list(set([item for item in list1 if item not in list2]))
+
+
+def listintersect(self, list1, list2):
+    """Return the common elements of list1 and list2."""
+    return list(set([item for item in list1 if item in list2]))
+
+
+def listunion(self, list1, list2):
+    """Return the union of list1 and list2."""
+    return list(set(list1 + list2))
+
+
+def listsubseteq(self, list1, list2):
+    """Test if list1 is a subset or equal to list2."""
+    return set(list1).issubset(set(list2))
 
 
 class DD:
@@ -75,7 +97,6 @@ class DD:
     REMOVE = "REMOVE"                   # Remove deltas to resolve
 
     # Debugging output
-    debug_test = False
     debug_dd = False
     debug_split = False
     debug_resolve = False
@@ -83,65 +104,10 @@ class DD:
     def __init__(self):
         self.__resolving = False
         self.__last_reported_length = False
-        self.monotony = False
-        self.cache_outcomes = True
         self.minimize = True
         self.maximize = True
-        self.assume_axioms_hold = True
         self.cachehits = 0
         self.cachemisses = 0
-
-    # Helpers
-    def __listminus(self, c1, c2):
-        """Return a list of all elements of C1 that are not in C2."""
-        s2 = {}
-        for delta in c2:
-            s2[delta] = 1
-
-        c = []
-        for delta in c1:
-            if delta not in s2:
-                c.append(delta)
-
-        return c
-
-    def __listintersect(self, c1, c2):
-        """Return the common elements of C1 and C2."""
-        s2 = {}
-        for delta in c2:
-            s2[delta] = 1
-
-        c = []
-        for delta in c1:
-            if delta in s2:
-                c.append(delta)
-
-        return c
-
-    def __listunion(self, c1, c2):
-        """Return the union of C1 and C2."""
-        s1 = {}
-        for delta in c1:
-            s1[delta] = 1
-
-        c = c1[:]
-        for delta in c2:
-            if delta not in s1:
-                c.append(delta)
-
-        return c
-
-    def __listsubseteq(self, c1, c2):
-        """Return 1 if C1 is a subset or equal to C2."""
-        s2 = {}
-        for delta in c2:
-            s2[delta] = 1
-
-        for delta in c1:
-            if delta not in s2:
-                return 0
-
-        return 1
 
     # Output
     def coerce(self, c):
@@ -215,9 +181,9 @@ class DD:
         """Repeat testing CSUB + R while unresolved."""
 
         initial_csub = csub[:]
-        c2 = self.__listunion(r, c)
+        c2 = listunion(r, c)
 
-        csubr = self.__listunion(csub, r)
+        csubr = listunion(csub, r)
         t = self.test(tuple(csubr))
 
         # necessary to use more resolving mechanisms which can reverse each
@@ -251,7 +217,7 @@ class DD:
             return Result.UNRESOLVED, initial_csub
 
         # assert t == Result.PASS or t == Result.FAIL
-        csub = self.__listminus(csubr, r)
+        csub = listminus(csubr, r)
         return t, csub
 
     # Inquiries
@@ -273,8 +239,8 @@ class DD:
                 return (t, csub)
 
         if self.maximize:
-            csubbar = self.__listminus(self.CC, csub)
-            cbar = self.__listminus(self.CC, c)
+            csubbar = listminus(self.CC, csub)
+            cbar = listminus(self.CC, c)
             if direction == self.ADD:
                 directionbar = self.REMOVE
             else:
@@ -283,7 +249,7 @@ class DD:
             (tbar, csubbar) = self.test_and_resolve(csubbar, [], cbar,
                                                     directionbar)
 
-            csub = self.__listminus(self.CC, csubbar)
+            csub = listminus(self.CC, csubbar)
 
             if tbar == Result.PASS:
                 t = Result.FAIL
@@ -379,12 +345,12 @@ class DD:
 
                 for j in range(n):
                     i = (j + cbar_offset) % n
-                    cbars[i] = self.__listminus(c, cs[i])
+                    cbars[i] = listminus(c, cs[i])
                     t, cbars[i] = self.test_mix(cbars[i], c, self.ADD)
 
-                    doubled = self.__listintersect(cbars[i], cs[i])
+                    doubled = listintersect(cbars[i], cs[i])
                     if doubled != []:
-                        cs[i] = self.__listminus(cs[i], doubled)
+                        cs[i] = listminus(cs[i], doubled)
 
                     if t == Result.FAIL:
                         if self.debug_dd:
@@ -393,7 +359,7 @@ class DD:
                             print(self.pretty(cbars[i]))
 
                         cbar_failed = 1
-                        next_c = self.__listintersect(next_c, cbars[i])
+                        next_c = listintersect(next_c, cbars[i])
                         next_n = next_n - 1
                         self.report_progress(next_c, "dd")
 
@@ -448,18 +414,12 @@ class DD:
                 print(f"dd: c1 = {self.pretty(c1)}")
                 print(f"dd: c2 = {self.pretty(c2)}")
 
-            if self.assume_axioms_hold:
-                t1 = Result.PASS
-                t2 = Result.FAIL
-            else:
-                t1 = self.test(tuple(c1))
-                t2 = self.test(tuple(c2))
+            t1 = Result.PASS
+            t2 = Result.FAIL
 
-            assert t1 == Result.PASS
-            assert t2 == Result.FAIL
-            assert self.__listsubseteq(c1, c2)
+            assert listsubseteq(c1, c2)
 
-            c = self.__listminus(c2, c1)
+            c = listminus(c2, c1)
 
             if self.debug_dd:
                 print(f"dd: c2 - c1 = {self.pretty(c)}")
@@ -495,7 +455,7 @@ class DD:
                     print(f"dd: trying {self.pretty(cs[i])}")
 
                 (t, csub) = self.test_and_resolve(cs[i], c1, c, self.REMOVE)
-                csub = self.__listunion(c1, csub)
+                csub = listunion(c1, csub)
 
                 if t == Result.FAIL and t1 == Result.PASS:
                     # Found
@@ -521,9 +481,9 @@ class DD:
                         print(self.pretty(next_c1))
                     break
 
-                csub = self.__listminus(c, cs[i])
+                csub = listminus(c, cs[i])
                 (t, csub) = self.test_and_resolve(csub, c1, c, self.ADD)
-                csub = self.__listunion(c1, csub)
+                csub = listunion(c1, csub)
 
                 if t == Result.PASS and t2 == Result.FAIL:
                     # Found
@@ -550,7 +510,7 @@ class DD:
                     break
 
             if progress:
-                self.report_progress(self.__listminus(next_c2, next_c1), "dd")
+                self.report_progress(listminus(next_c2, next_c1), "dd")
             else:
                 if n >= len(c):
                     # No further minimizing
