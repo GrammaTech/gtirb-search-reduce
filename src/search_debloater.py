@@ -14,9 +14,10 @@ from search.DD import DD, Result
 
 
 class DDBlocks(DD):
-    def __init__(self, infile, keep_passing=False):
+    def __init__(self, infile, trampoline, keep_passing=False):
         DD.__init__(self)
         self.infile = infile
+        self.trampoline = trampoline
         self._read_ir()
         self.blocklist = block_deleter.block_addresses(self._ir)
         self.keep_passing = keep_passing
@@ -60,7 +61,9 @@ class DDBlocks(DD):
 
             # Compile
             logging.info("Compiling")
-            build_command = ['gcc', asm_file, '-o', exe_file]
+            build_command = ['gcc', '-no-pie',
+                             asm_file, self.trampoline,
+                             '-o', exe_file]
             try:
                 result = subprocess.run(build_command)
                 if result.returncode != 0:
@@ -85,6 +88,10 @@ def main():
                         help="output GTIRB file",
                         action='store',
                         default='out.ir')
+    parser.add_argument("-t", "--trampoline",
+                        help="trampoline file",
+                        action='store',
+                        default='etc/__gtirb_trampoline.S')
     parser.add_argument("--log-level",
                         help="logging level",
                         action='store',
@@ -94,6 +101,10 @@ def main():
                         action='store')
 
     args = parser.parse_args()
+    if not os.path.exists(args.input):
+        sys.exit(f"Error: Input file {args.infile} does not exist.")
+    if not os.path.exists(args.trampoline):
+        sys.exit(f"Error: Trampoline file {args.trampoline} does not exist")
 
     format = '[%(levelname)s] %(asctime)s - %(module)s: %(message)s'
     datefmt = '%m/%d %H:%M:%S'
@@ -104,7 +115,7 @@ def main():
         logging.basicConfig(level=args.log_level, format=format,
                             datefmt=datefmt)
 
-    dd = DDBlocks(args.input)
+    dd = DDBlocks(args.input, args.trampoline)
     blocks = dd.ddmax(dd.blocklist)
 
     ir_out = ir.toProtobuf()
