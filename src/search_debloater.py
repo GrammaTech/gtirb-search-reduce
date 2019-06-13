@@ -30,8 +30,8 @@ class DDBlocks(DD):
         self._factory = self._ir_loader._factory
 
     def _test(self, delete_blocks):
-        logging.info(f"Processing: \n"
-                     f"{' '.join([str(b) for b in delete_blocks])}")
+        logging.debug(f"Processing: \n"
+                      f"{' '.join([str(b) for b in delete_blocks])}")
         # Re-read IR every time
         logging.info("Reading IR")
         self._read_ir()
@@ -42,6 +42,7 @@ class DDBlocks(DD):
         # Output to a GTIRB file
         with tempfile.NamedTemporaryFile(mode='w+b') as temp:
             temp.write(self._ir.toProtobuf().SerializeToString())
+            temp.flush()
             asm_file = temp.name + '.S'
             exe_file = temp.name + '.exe'
             # Dump assembly
@@ -50,7 +51,9 @@ class DDBlocks(DD):
                                 '-i', temp.name,
                                 '-o', asm_file]
             try:
-                result = subprocess.run(pprinter_command)
+                result = subprocess.run(pprinter_command,
+                                        stdout=subprocess.DEVNULL,
+                                        stderr=subprocess.DEVNULL)
                 if result.returncode != 0:
                     logging.error("gtirb-pprinter failed to assemble "
                                   f"{asm_file}")
@@ -106,7 +109,7 @@ def main():
     if not os.path.exists(args.trampoline):
         sys.exit(f"Error: Trampoline file {args.trampoline} does not exist")
 
-    format = '[%(levelname)s] %(asctime)s - %(module)s: %(message)s'
+    format = '[%(levelname)-8s %(asctime)s] - %(module)s: %(message)s'
     datefmt = '%m/%d %H:%M:%S'
     if args.log_file:
         logging.basicConfig(filename=args.log_file, format=format,
