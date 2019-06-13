@@ -42,6 +42,7 @@
 # Andreas Zeller
 
 from enum import Enum, auto
+import logging
 from functools import lru_cache
 
 
@@ -96,11 +97,6 @@ class DD:
     ADD = "ADD"                         # Add deltas to resolve
     REMOVE = "REMOVE"                   # Remove deltas to resolve
 
-    # Debugging output
-    debug_dd = False
-    debug_split = False
-    debug_resolve = False
-
     def __init__(self):
         self.__resolving = False
         self.__last_reported_length = False
@@ -135,13 +131,11 @@ class DD:
     # Splitting
     def split(self, c, n):
         """Split C into [C_1, C_2, ..., C_n]."""
-        if self.debug_split:
-            print(f"split({self.coerce(c)}, {n})...")
+        logging.debug(f"split({self.coerce(c)}, {n})...")
 
         outcome = self._split(c, n)
 
-        if self.debug_split:
-            print(f"split({self.coerce(c)}, {n}) = {outcome}")
+        logging.debug(f"split({self.coerce(c)}, {n}) = {outcome}")
 
         return outcome
 
@@ -160,14 +154,12 @@ class DD:
         """If direction == ADD, resolve inconsistency by adding deltas
            to CSUB.  Otherwise, resolve by removing deltas from CSUB."""
 
-        if self.debug_resolve:
-            print(f"resolve({csub}, {self.coerce(c)}, {direction})...")
+        logging.debug(f"resolve({csub}, {self.coerce(c)}, {direction})...")
 
         outcome = self._resolve(csub, c, direction)
 
-        if self.debug_resolve:
-            print(f"resolve({csub}, {self.coerce(c)}, "
-                  f"{direction}) = {outcome}")
+        logging.debug(f"resolve({csub}, {self.coerce(c)}, "
+                      f"{direction}) = {outcome}")
 
         return outcome
 
@@ -228,8 +220,7 @@ class DD:
     # Logging
     def report_progress(self, c, title):
         if len(c) != self.__last_reported_length:
-            print()
-            print(f"{title}: {len(c)} deltas left:{self.coerce(c)}")
+            logging.info(f"{title}: {len(c)} deltas left:{self.coerce(c)}")
             self.__last_reported_length = len(c)
 
     def test_mix(self, csub, c, direction):
@@ -270,13 +261,9 @@ class DD:
         n = 2
         self.CC = c
 
-        if self.debug_dd:
-            print(f"dd({self.pretty(c)}, {n})...")
-
+        logging.debug(f"dd({self.pretty(c)}, {n})...")
         outcome = self._dd(c, n)
-
-        if self.debug_dd:
-            print(f"dd({self.pretty(c)}, {n}) = {outcome}")
+        logging.debug(f"dd({self.pretty(c)}, {n}) = {outcome}")
 
         return outcome
 
@@ -292,25 +279,18 @@ class DD:
         while True:
             tc = self.test(tuple(c))
             assert tc == Result.FAIL or tc == Result.UNRESOLVED
-            print(self.test.cache_info())
+            logging.info(self.test.cache_info())
 
             if n > len(c):
                 # No further minimizing
-                print("dd: done")
+                logging.info("done")
                 return c
 
             self.report_progress(c, "dd")
 
             cs = self.split(c, n)
-
-            print()
-            print(f"dd (run #{run}): trying", end='')
-            for i in range(n):
-                if i > 0:
-                    print("+", end='')
-                print(len(cs[i]), end='')
-            print()
-
+            logging.info(f"(run {run}): trying "
+                         f"{'+'.join([str(len(cs[i])) for i in range(n)])}")
             c_failed = False
             cbar_failed = False
 
@@ -319,17 +299,14 @@ class DD:
 
             # Check subsets
             for i in range(n):
-                if self.debug_dd:
-                    print(f"dd: trying {self.pretty(cs[i])}")
+                logging.debug(f"trying {self.pretty(cs[i])}")
 
                 (t, cs[i]) = self.test_mix(cs[i], c, self.REMOVE)
 
                 if t == Result.FAIL:
                     # Found
-                    if self.debug_dd:
-                        print(f"dd: found {len(cs[i])} deltas:")
-                        print(self.pretty(cs[i]))
-
+                    logging.debug(f"found {len(cs[i])} deltas:\n"
+                               f"{self.pretty(cs[i])}")
                     c_failed = True
                     next_c = cs[i]
                     next_n = 2
@@ -340,9 +317,6 @@ class DD:
             if not c_failed:
                 # Check complements
                 cbars = n * [Result.UNRESOLVED]
-
-                # print(f"cbar_offset = {cbar_offset}")
-
                 for j in range(n):
                     i = (j + cbar_offset) % n
                     cbars[i] = listminus(c, cs[i])
@@ -353,10 +327,9 @@ class DD:
                         cs[i] = listminus(cs[i], doubled)
 
                     if t == Result.FAIL:
-                        if self.debug_dd:
-                            print(f"dd: reduced to {len(cbars[i])}")
-                            print("deltas:")
-                            print(self.pretty(cbars[i]))
+                        logging.debug(f"reduced to {len(cbars[i])}\n"
+                                      "deltas:\n"
+                                      f"{self.pretty(cbars[i])}")
 
                         cbar_failed = True
                         next_c = listintersect(next_c, cbars[i])
@@ -370,11 +343,11 @@ class DD:
             if not c_failed and not cbar_failed:
                 if n >= len(c):
                     # No further minimizing
-                    print("dd: done")
+                    logging.info("done")
                     return c
 
                 next_n = min(len(c), n * 2)
-                print(f"dd: increase granularity to {next_n}")
+                logging.info(f"increase granularity to {next_n}")
                 cbar_offset = (cbar_offset * next_n) // n
 
             c = next_c
@@ -393,14 +366,9 @@ class DD:
     # General delta debugging (new TSE version)
     def dddiff(self, c):
         n = 2
-
-        if self.debug_dd:
-            print(f"dddiff({self.pretty(c)}, {n})...")
-
+        logging.debug(f"dddiff({self.pretty(c)}, {n})...")
         outcome = self._dddiff([], c, n)
-
-        if self.debug_dd:
-            print(f"dddiff({self.pretty(c)}, {n}) = {outcome}")
+        logging.debug(f"dddiff({self.pretty(c)}, {n}) = {outcome}")
 
         return outcome
 
@@ -410,37 +378,26 @@ class DD:
 
         # We replace the tail recursion from the paper by a loop
         while 1:
-            if self.debug_dd:
-                print(f"dd: c1 = {self.pretty(c1)}")
-                print(f"dd: c2 = {self.pretty(c2)}")
+            logging.debug(f"c1 = {self.pretty(c1)}")
+            logging.debug(f"c2 = {self.pretty(c2)}")
 
             t1 = Result.PASS
             t2 = Result.FAIL
 
             assert listsubseteq(c1, c2)
-
             c = listminus(c2, c1)
-
-            if self.debug_dd:
-                print(f"dd: c2 - c1 = {self.pretty(c)}")
+            logging.debug(f"c2 - c1 = {self.pretty(c)}")
 
             if n > len(c):
                 # No further minimizing
-                print("dd: done")
+                logging.info("done")
                 return (c, c1, c2)
 
             self.report_progress(c, "dd")
-
             cs = self.split(c, n)
 
-            print()
-            print(f"dd (run #{run}): trying", end='')
-            for i in range(n):
-                if i > 0:
-                    print("+", end='')
-                print(len(cs[i]), end='')
-            print()
-
+            logging.info(f"(run #{run}): trying\n"
+                         f"{'+'.join([str(len(cs[i])) for i in range(n)])}")
             progress = False
 
             next_c1 = c1[:]
@@ -450,9 +407,7 @@ class DD:
             # Check subsets
             for j in range(n):
                 i = (j + cbar_offset) % n
-
-                if self.debug_dd:
-                    print(f"dd: trying {self.pretty(cs[i])}")
+                logging.debug(f"trying {self.pretty(cs[i])}")
 
                 (t, csub) = self.test_and_resolve(cs[i], c1, c, self.REMOVE)
                 csub = listunion(c1, csub)
@@ -463,10 +418,8 @@ class DD:
                     next_c2 = csub
                     next_n = 2
                     cbar_offset = 0
-
-                    if self.debug_dd:
-                        print(f"dd: reduce c2 to {len(next_c2)} deltas:")
-                        print(self.pretty(next_c2))
+                    logging.debug(f"reduce c2 to {len(next_c2)} deltas:\n"
+                                  f"{self.pretty(next_c2)}")
                     break
 
                 if t == Result.PASS and t2 == Result.FAIL:
@@ -475,10 +428,8 @@ class DD:
                     next_c1 = csub
                     next_n = max(next_n - 1, 2)
                     cbar_offset = i
-
-                    if self.debug_dd:
-                        print(f"dd: increase c1 to {len(next_c1)} deltas:")
-                        print(self.pretty(next_c1))
+                    logging.debug(f"increase c1 to {len(next_c1)} deltas:\n"
+                                  f"{self.pretty(next_c1)}")
                     break
 
                 csub = listminus(c, cs[i])
@@ -491,10 +442,8 @@ class DD:
                     next_c1 = csub
                     next_n = 2
                     cbar_offset = 0
-
-                    if self.debug_dd:
-                        print(f"dd: increase c1 to {len(next_c1)} deltas:")
-                        print(self.pretty(next_c1))
+                    logging.debug(f"increase c1 to {len(next_c1)} deltas:\n"
+                                  f"{self.pretty(next_c1)}")
                     break
 
                 if t == Result.FAIL and t1 == Result.PASS:
@@ -503,10 +452,8 @@ class DD:
                     next_c2 = csub
                     next_n = max(next_n - 1, 2)
                     cbar_offset = i
-
-                    if self.debug_dd:
-                        print(f"dd: reduce c2 to {len(next_c2)} deltas:")
-                        print(self.pretty(next_c2))
+                    logging.debug(f"reduce c2 to {len(next_c2)} deltas:\n"
+                                  f"{self.pretty(next_c2)}")
                     break
 
             if progress:
@@ -514,11 +461,11 @@ class DD:
             else:
                 if n >= len(c):
                     # No further minimizing
-                    print("dd: done")
+                    logging.info("done")
                     return (c, c1, c2)
 
                 next_n = min(len(c), n * 2)
-                print(f"dd: increase granularity to {next_n}")
+                logging.info(f"increase granularity to {next_n}")
                 cbar_offset = (cbar_offset * next_n) // n
 
             c1 = next_c1

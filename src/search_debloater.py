@@ -2,6 +2,7 @@
 
 import argparse
 import copy
+import logging
 import tempfile
 import subprocess
 import sys
@@ -10,8 +11,6 @@ from gtirb import *
 
 import block_deleter
 from search.DD import DD, Result
-
-verbosity = 0
 
 
 class DDBlocks(DD):
@@ -30,61 +29,53 @@ class DDBlocks(DD):
         self._factory = self._ir_loader._factory
 
     def _test(self, delete_blocks):
-        print(' '.join([str(b) for b in delete_blocks]))
+        logging.info(f"Processing: \n"
+                     f"{' '.join([str(b) for b in delete_blocks])}")
         # Re-read IR every time
-        if verbosity > 0:
-            print("SEARCH: Reading IR")
+        logging.info("Reading IR")
         self._read_ir()
         # Generate new IR
-        if verbosity > 0:
-            print("SEARCH: Deleting blocks")
+        logging.info("Deleting blocks")
         block_deleter.remove_blocks(self._ir, self._factory,
-                                    block_addresses=delete_blocks,
-                                    verbosity=verbosity)
+                                    block_addresses=delete_blocks)
         # Output to a GTIRB file
         with tempfile.NamedTemporaryFile(mode='w+b') as temp:
             temp.write(self._ir.toProtobuf().SerializeToString())
             asm_file = temp.name + '.S'
             exe_file = temp.name + '.exe'
             # Dump assembly
-            if verbosity > 0:
-                print("SEARCH: Dumping assembly")
+            logging.info("Dumping assembly")
             pprinter_command = ['gtirb-pprinter',
                                 '-i', temp.name,
                                 '-o', asm_file]
             try:
                 result = subprocess.run(pprinter_command)
                 if result.returncode != 0:
-                    print("ERROR: gtirb-pprinter failed to assemble "
-                          f"{asm_file}", file=sys.stderr)
+                    logging.error("gtirb-pprinter failed to assemble "
+                                  f"{asm_file}")
                     return Result.FAIL
             except Exception:
-                print("ERROR: exception while running gtirb-pprinter",
-                      file=sys.stderr)
+                logging.error("Exception while running gtirb-pprinter")
                 return Result.FAIL
 
             # Compile
-            if verbosity > 0:
-                print("SEARCH: Compiling")
+            logging.info("Compiling")
             build_command = ['gcc', asm_file, '-o', exe_file]
             try:
                 result = subprocess.run(build_command)
                 if result.returncode != 0:
-                    print(f"ERROR: gcc failed to build {exe_file}",
-                          file=sys.stderr)
+                    logging.error(f"gcc failed to build {exe_file}")
                     return Result.FAIL
             except Exception:
-                print("ERROR: exception while running gcc", file=sys.stderr)
+                logging.error("exception while running gcc")
                 return Result.FAIL
             # Run tests
-            if verbosity > 0:
-                print("SEARCH: Testing")
+            logging.info("Testing")
             # FIXME
             return Result.PASS
 
 
 def main():
-    global verbosity
     parser = argparse.ArgumentParser()
     parser.add_argument("-i", "--input",
                         help="input GTIRB file",
@@ -94,13 +85,24 @@ def main():
                         help="output GTIRB file",
                         action='store',
                         default='out.ir')
-    parser.add_argument("-v", "--verbose",
-                        help="verbosity level",
-                        action='count',
-                        default=0)
+    parser.add_argument("--log-level",
+                        help="logging level",
+                        action='store',
+                        default=logging.INFO)
+    parser.add_argument("--log-file",
+                        help="log file",
+                        action='store')
+
     args = parser.parse_args()
 
-    verbosity = args.verbose
+    format = '[%(levelname)s] %(asctime)s - %(module)s: %(message)s'
+    datefmt = '%m/%d %H:%M:%S'
+    if args.log_file:
+        logging.basicConfig(filename=args.log_file, format=format,
+                            datefmt=datefmt, level=args.log_level)
+    else:
+        logging.basicConfig(level=args.log_level, format=format,
+                            datefmt=datefmt)
 
     dd = DDBlocks(args.input)
     blocks = dd.ddmax(dd.blocklist)

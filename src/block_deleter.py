@@ -1,6 +1,7 @@
 # Large parts copied from block_remove.py in the rewriting/gtirb-reduce repo
 
 import argparse
+import logging
 import sys
 import os
 import pprint
@@ -54,7 +55,7 @@ def remove_node(graph, target_node):
     return out_edges
 
 
-def remove_blocks(ir, factory, block_addresses=list(), verbosity=0):
+def remove_blocks(ir, factory, block_addresses=list()):
     for module in ir._modules:
         blocks_by_addr = dict()
         cfg = module._cfg
@@ -68,9 +69,8 @@ def remove_blocks(ir, factory, block_addresses=list(), verbosity=0):
             if hasattr(block, '_address'):
                 blocks_by_addr[block._address] = block
 
-        if verbosity > 2:
-            print("Removing blocks "
-                  f"{' '.join([f'{b:x}' for b in block_addresses])}")
+        logging.debug("Removing blocks "
+                      f"{' '.join([f'{b:x}' for b in block_addresses])}")
         # Add CFG edges to graph
         for edge in cfg._edges:
             add_edge(graph, edge.source(), edge.target(), edge)
@@ -79,12 +79,12 @@ def remove_blocks(ir, factory, block_addresses=list(), verbosity=0):
         blocks_removed = list()
         for b in block_addresses:
             if b not in blocks_by_addr:
-                print(f"WARNING: No block with address {b:x} found")
+                logging.warning(f"No block with address {b:x} found")
                 continue
             blocks_removed.append(blocks_by_addr[b])
             edges_removed.update(set(remove_node(graph, blocks_by_addr[b])))
 
-        if verbosity > 1:
+        if logging.getLogger().isEnabledFor(logging.DEBUG):
             for edge_removed in edges_removed:
                 source = edge_removed.source()
                 s_addr = source._address
@@ -93,10 +93,9 @@ def remove_blocks(ir, factory, block_addresses=list(), verbosity=0):
                     continue
                 t_addr = target._address
                 if (target in blocks_removed and source not in blocks_removed):
-                        print(f"WARNING: {t_addr:x} removed,"
-                              f" but {s_addr:x} references it")
-                if verbosity > 2:
-                    print(f"MESSAGE: removed edge {s_addr:x} -> {t_addr:x}")
+                    logging.debug(f"{t_addr:x} removed,"
+                                  f" but {s_addr:x} references it")
+                logging.debug(f"removed edge {s_addr:x} -> {t_addr:x}")
 
         symbols_to_remove = list()
         for symbol in module.symbols():
