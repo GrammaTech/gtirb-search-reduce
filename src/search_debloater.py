@@ -21,6 +21,7 @@ class DDBlocks(DD):
         self._read_ir()
         self.blocklist = block_deleter.block_addresses(self._ir)
         self.keep_passing = keep_passing
+        self.test_count = 0
 
     def _read_ir(self):
         if not os.path.exists(self.infile):
@@ -32,6 +33,7 @@ class DDBlocks(DD):
     def _test(self, delete_blocks):
         logging.debug(f"Processing: \n"
                       f"{' '.join([str(b) for b in delete_blocks])}")
+        self.test_count += 1
         # Re-read IR every time
         logging.info("Reading IR")
         self._read_ir()
@@ -40,23 +42,26 @@ class DDBlocks(DD):
         block_deleter.remove_blocks(self._ir, self._factory,
                                     block_addresses=delete_blocks)
         # Output to a GTIRB file
-        with tempfile.NamedTemporaryFile(mode='w+b') as temp:
-            temp.write(self._ir.toProtobuf().SerializeToString())
-            temp.flush()
-            asm_file = temp.name + '.S'
-            exe_file = temp.name + '.exe'
+        with tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
+                                         suffix='.ir') as ir_file, \
+             tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
+                                         suffix='.S') as asm, \
+             tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
+                                         suffix='.exe') as exe:
+            ir_file.write(self._ir.toProtobuf().SerializeToString())
+            ir_file.flush()
             # Dump assembly
             logging.info("Dumping assembly")
             pprinter_command = ['gtirb-pprinter',
-                                '-i', temp.name,
-                                '-o', asm_file]
+                                '-i', ir_file.name,
+                                '-o', asm.name]
             try:
                 result = subprocess.run(pprinter_command,
                                         stdout=subprocess.DEVNULL,
                                         stderr=subprocess.DEVNULL)
                 if result.returncode != 0:
                     logging.error("gtirb-pprinter failed to assemble "
-                                  f"{asm_file}")
+                                  f"{asm.name}")
                     return Result.FAIL
             except Exception:
                 logging.error("Exception while running gtirb-pprinter")
@@ -65,12 +70,12 @@ class DDBlocks(DD):
             # Compile
             logging.info("Compiling")
             build_command = ['gcc', '-no-pie',
-                             asm_file, self.trampoline,
-                             '-o', exe_file]
+                             asm.name, self.trampoline,
+                             '-o', exe.name]
             try:
                 result = subprocess.run(build_command)
                 if result.returncode != 0:
-                    logging.error(f"gcc failed to build {exe_file}")
+                    logging.error(f"gcc failed to build {exe.name}")
                     return Result.FAIL
             except Exception:
                 logging.error("exception while running gcc")
