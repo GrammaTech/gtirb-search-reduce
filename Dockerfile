@@ -91,8 +91,7 @@ RUN rm -rf /gtirb/build \
     /gtirb/CMakeScripts
 WORKDIR /build/gtirb
 RUN cmake /gtirb -DCMAKE_CXX_COMPILER=${CXX_COMPILER} \
-    && make \
-    && rm -rf /gtirb
+    && make
 ENV PATH=/build/gtirb/bin:$PATH
 WORKDIR python
 RUN python3 setup.py install
@@ -105,8 +104,7 @@ RUN rm -rf /gtirb-pprinter/build \
     /gtirb-pprinter/CMakeScripts
 WORKDIR /build/gtirb-pprinter
 RUN cmake /gtirb-pprinter -DCMAKE_CXX_COMPILER=${CXX_COMPILER} \
-    && make \
-    && rm -rf /gtirb-pprinter
+    && make
 ENV PATH=/build/gtirb-pprinter/bin:$PATH
 
 # Build ddisasm
@@ -118,6 +116,5 @@ RUN rm -rf /ddisasm/build \
     /ddisasm/CMakeScripts
 WORKDIR /build/ddisasm
 RUN cmake /ddisasm -DCMAKE_CXX_COMPILER=${CXX_COMPILER} -DCORES=8 \
-    && make \
-    && rm -rf /ddisasm
+    && make
 ENV PATH=/build/ddisasm/bin:$PATH
