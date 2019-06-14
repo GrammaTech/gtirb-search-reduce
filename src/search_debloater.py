@@ -62,9 +62,11 @@ class DDBlocks(DD):
                 if result.returncode != 0:
                     logging.error("gtirb-pprinter failed to assemble "
                                   f"{asm.name}")
+                    logging.info("FAIL")
                     return Result.FAIL
             except Exception:
                 logging.error("Exception while running gtirb-pprinter")
+                logging.info("FAIL")
                 return Result.FAIL
 
             # Compile
@@ -76,13 +78,16 @@ class DDBlocks(DD):
                 result = subprocess.run(build_command)
                 if result.returncode != 0:
                     logging.error(f"gcc failed to build {exe.name}")
+                    logging.info("FAIL")
                     return Result.FAIL
             except Exception:
                 logging.error("exception while running gcc")
+                logging.info("FAIL")
                 return Result.FAIL
             # Run tests
             logging.info("Testing")
             # FIXME
+            logging.info("PASS")
             return Result.PASS
 
 
