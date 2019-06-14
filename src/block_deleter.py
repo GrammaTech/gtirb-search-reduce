@@ -69,57 +69,66 @@ def remove_blocks(ir, factory, block_addresses=list()):
             if hasattr(block, '_address'):
                 blocks_by_addr[block._address] = block
 
-        logging.debug("Removing blocks "
-                      f"{' '.join([f'{b:x}' for b in block_addresses])}")
         # Add CFG edges to graph
+        logging.debug("Building graph")
         for edge in cfg._edges:
             add_edge(graph, edge.source(), edge.target(), edge)
 
-        edges_removed = set([])
-        blocks_removed = list()
+        # Using sets instead of a lists here greatly speeds up the
+        # `if x in` checks
+        edges_removed = set()
+        blocks_removed = set()
+        logging.debug("Removing blocks "
+                      f"{' '.join([f'{b:x}' for b in block_addresses])}")
+
+        # Remove nodes from the graph, returned list of edges correspond to the
+        # edges that must be deleted from the IR
         for b in block_addresses:
             if b not in blocks_by_addr:
                 logging.warning(f"No block with address {b:x} found")
                 continue
-            blocks_removed.append(blocks_by_addr[b])
+            blocks_removed.add(blocks_by_addr[b])
             edges_removed.update(set(remove_node(graph, blocks_by_addr[b])))
 
-        if logging.getLogger().isEnabledFor(logging.DEBUG):
-            for edge_removed in edges_removed:
-                source = edge_removed.source()
-                s_addr = source._address
-                target = edge_removed.target()
-                if isinstance(target, ProxyBlock):
-                    continue
-                t_addr = target._address
-                if (target in blocks_removed and source not in blocks_removed):
-                    logging.debug(f"{t_addr:x} removed,"
-                                  f" but {s_addr:x} references it")
-                logging.debug(f"removed edge {s_addr:x} -> {t_addr:x}")
+        # if logging.getLogger().isEnabledFor(logging.DEBUG):
+        #     for edge_removed in edges_removed:
+        #         source = edge_removed.source()
+        #         s_addr = source._address
+        #         target = edge_removed.target()
+        #         if isinstance(target, ProxyBlock):
+        #             continue
+        #         t_addr = target._address
+        #         if (target in blocks_removed and source not in blocks_removed):
+        #             logging.debug(f"{t_addr:x} removed,"
+        #                           f" but {s_addr:x} references it")
+        #         logging.debug(f"removed edge {s_addr:x} -> {t_addr:x}")
 
+        # Collects the symbols that refer to removed blocks so the symbols can
+        # also be removed
+        logging.debug("Collecting symbols to remove")
         symbols_to_remove = list()
         for symbol in module.symbols():
             block = symbol.referent()
             if isinstance(block, Block) and block in blocks_removed:
                 symbols_to_remove.append(symbol)
 
+        logging.debug("Removing symbols")
         for symbol in symbols_to_remove:
             module._symbols.remove(symbol)
 
         # Remove symbol references to the block addresses and replace them with
         # a call to the trampoline symbol
-        for key, value in module._symbolic_operands.items():
+        logging.debug("Pointing stale references to trampoline")
+        for op in module._symbolic_operands.values():
             try:
-                if value is not None and isinstance(value, SymAddrConst):
-                    symbol = value.symbol()
-                    if symbol is not None:
-                        ref = symbol.referent()
-                        if ref and ref in blocks_removed:
-                            value.setSymbol(extern_trampoline)
+                if op.symbol().referent() in blocks_removed:
+                    op.setSymbol(extern_trampoline)
             except Exception:
                 pass
 
-        module.removeBlocks(set(blocks_removed))
+        logging.debug("Deleting blocks from GTIRB")
+        module.removeBlocks(blocks_removed)
+        logging.debug("Deleting edges from GTIRB CFG")
         cfg.removeEdges(edges_removed)
         function_blocks = module.auxData('functionBlocks')
         for value in function_blocks.values():
