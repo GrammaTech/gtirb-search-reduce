@@ -48,9 +48,7 @@ class DDBlocks(DD):
         with tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
                                          suffix='.ir') as ir_file, \
              tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
-                                         suffix='.S') as asm, \
-             tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
-                                         suffix='.exe', delete=False) as exe:
+                                         suffix='.S') as asm:
             ir_file.write(self._ir.toProtobuf().SerializeToString())
             ir_file.flush()
             # Dump assembly
@@ -73,25 +71,37 @@ class DDBlocks(DD):
                 return Result.PASS
 
             # Compile
-            logging.info("Compiling")
-            build_command = ['gcc', '-no-pie',
-                             asm.name, self.trampoline,
-                             '-o', exe.name]
-            try:
-                result = subprocess.run(build_command)
-                if result.returncode != 0:
-                    logging.error(f"gcc failed to build {exe.name}")
+            with tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
+                                             suffix='.exe',
+                                             delete=False) as exe:
+                logging.info("Compiling")
+                build_command = ['gcc', '-no-pie',
+                                 asm.name, self.trampoline,
+                                 '-o', exe.name]
+                try:
+                    res = subprocess.run(build_command,
+                                         stdout=subprocess.PIPE,
+                                         stderr=subprocess.PIPE)
+                    if res.returncode != 0:
+                        logging.info(f"gcc failed to build with error:\n"
+                                     f"{res.stderr.decode('utf-8').strip()}")
+                        logging.info("FAIL")
+                        return Result.PASS
+                except Exception:
+                    logging.error("exception while running gcc")
                     logging.info("FAIL")
                     return Result.PASS
-            except Exception:
-                logging.error("exception while running gcc")
-                logging.info("FAIL")
-                return Result.PASS
             # Run tests
             logging.info("Testing")
-            # FIXME
-            logging.info("PASS")
-            return Result.FAIL
+            test_command = ['tests/test.py', exe.name]
+            result = subprocess.run(test_command)
+            if result.returncode == 0:
+                logging.info("PASS")
+                return Result.FAIL
+            else:
+                os.remove(exe.name)
+                logging.info("FAIL")
+                return Result.PASS
 
 
 def main():
