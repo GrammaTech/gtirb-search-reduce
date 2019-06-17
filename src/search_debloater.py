@@ -97,6 +97,8 @@ class DDBlocks(DD):
             result = subprocess.run(test_command)
             if result.returncode == 0:
                 logging.info("PASS")
+                logging.info("Blocks deleted:\n"
+                             f"{' '.join([str(b) for b in delete_blocks])}")
                 return Result.FAIL
             else:
                 os.remove(exe.name)
