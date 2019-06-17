@@ -1,0 +1,5303 @@
+/* dfasearch.c - searching subroutines using dfa and regex for grep.
+   Copyright 1992, 1998, 2000, 2007, 2009-2016 Free Software Foundation, Inc.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 3, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA
+   02110-1301, USA.  */
+
+/* Written August 1992 by Mike Haertel. */
+
+#include <config.h>
+#include "intprops.h"
+#include "search.h"
+
+struct localeinfo localeinfo;
+
+/* Whether -w considers WC to be a word constituent.  */
+static bool
+wordchar (wint_t wc)
+{
+  return wc == L'_' || iswalnum (wc);
+}
+
+/* KWset compiled pattern.  For Ecompile and Gcompile, we compile
+   a list of strings, at least one of which is known to occur in
+   any string matching the regexp. */
+static kwset_t kwset;
+
+/* DFA compiled regexp. */
+static struct dfa *dfa;
+
+/* The Regex compiled patterns.  */
+static struct re_pattern_buffer *patterns;
+static size_t pcount;
+
+/* Number of compiled fixed strings known to exactly match the regexp.
+   If kwsexec returns < kwset_exact_matches, then we don't need to
+   call the regexp matcher at all. */
+static size_t kwset_exact_matches;
+
+static bool begline;
+
+void
+dfaerror (char const *mesg)
+{
+  error (EXIT_TROUBLE, 0, "%s", mesg);
+
+  /* notreached */
+  /* Tell static analyzers that this function does not return.  */
+  abort ();
+}
+
+/* For now, the sole dfawarn-eliciting condition (use of a regexp
+   like '[:lower:]') is unequivocally an error, so treat it as such,
+   when possible.  */
+void
+dfawarn (char const *mesg)
+{
+  static enum { DW_NONE = 0, DW_POSIX, DW_GNU } mode;
+  if (mode == DW_NONE)
+    mode = (getenv ("POSIXLY_CORRECT") ? DW_POSIX : DW_GNU);
+  if (mode == DW_GNU)
+    dfaerror (mesg);
+}
+
+/* If the DFA turns out to have some set of fixed strings one of
+   which must occur in the match, then we build a kwset matcher
+   to find those strings, and thus quickly filter out impossible
+   matches. */
+static void
+kwsmusts (void)
+{
+  struct dfamust *dm = dfamust (dfa);
+  if (!dm)
+    return;
+  kwset = kwsinit (false);
+  if (dm->exact)
+    {
+      /* Prepare a substring whose presence implies a match.
+         The kwset matcher will return the index of the matching
+         string that it chooses. */
+      ++kwset_exact_matches;
+      size_t old_len = strlen (dm->must);
+      size_t new_len = old_len + dm->begline + dm->endline;
+      char *must = xmalloc (new_len);
+      char *mp = must;
+      *mp = eolbyte;
+      mp += dm->begline;
+      begline |= dm->begline;
+      memcpy (mp, dm->must, old_len);
+      if (dm->endline)
+        mp[old_len] = eolbyte;
+      kwsincr (kwset, must, new_len);
+      free (must);
+    }
+  else
+    {
+      /* Otherwise, filtering with this substring should help reduce the
+         search space, but we'll still have to use the regexp matcher.  */
+      kwsincr (kwset, dm->must, strlen (dm->must));
+    }
+  kwsprep (kwset);
+  dfamustfree (dm);
+}
+
+void
+GEAcompile (char const *pattern, size_t size, reg_syntax_t syntax_bits)
+{
+  char *motif;
+
+  dfa = dfaalloc ();
+
+  if (match_icase)
+    syntax_bits |= RE_ICASE;
+  re_set_syntax (syntax_bits);
+  int dfaopts = ((match_icase ? DFA_CASE_FOLD : 0)
+                 | (eolbyte ? 0 : DFA_EOL_NUL));
+  dfasyntax (dfa, &localeinfo, syntax_bits, dfaopts);
+
+  /* For GNU regex, pass the patterns separately to detect errors like
+     "[\nallo\n]\n", where the patterns are "[", "allo" and "]", and
+     this should be a syntax error.  The same for backref, where the
+     backref should be local to each pattern.  */
+  char const *p = pattern;
+  char const *patlim = pattern + size;
+  bool compilation_failed = false;
+  size_t palloc = 0;
+
+  do
+    {
+      size_t len;
+      char const *sep = memchr (p, '\n', patlim - p);
+      if (sep)
+        {
+          len = sep - p;
+          sep++;
+        }
+      else
+        len = patlim - p;
+
+      if (palloc <= pcount)
+        patterns = x2nrealloc (patterns, &palloc, sizeof *patterns);
+      struct re_pattern_buffer *pat = &patterns[pcount];
+      pat->buffer = NULL;
+      pat->allocated = 0;
+
+      /* Do not use a fastmap with -i, to work around glibc Bug#20381.  */
+      pat->fastmap = match_icase ? NULL : xmalloc (UCHAR_MAX + 1);
+
+      pat->translate = NULL;
+
+      char const *err = re_compile_pattern (p, len, pat);
+      if (err)
+        {
+          /* With patterns specified only on the command line, emit the bare
+             diagnostic.  Otherwise, include a filename:lineno: prefix.  */
+          size_t lineno;
+          char const *pat_filename = pattern_file_name (pcount + 1, &lineno);
+          if (*pat_filename == '\0')
+            error (0, 0, "%s", err);
+          else
+            error (0, 0, "%s:%zu: %s", pat_filename, lineno, err);
+          compilation_failed = true;
+        }
+      pcount++;
+      p = sep;
+    }
+  while (p);
+
+  if (compilation_failed)
+    exit (EXIT_TROUBLE);
+
+  /* In the match_words and match_lines cases, we use a different pattern
+     for the DFA matcher that will quickly throw out cases that won't work.
+     Then if DFA succeeds we do some hairy stuff using the regex matcher
+     to decide whether the match should really count. */
+  if (match_words || match_lines)
+    {
+      static char const line_beg_no_bk[] = "^(";
+      static char const line_end_no_bk[] = ")$";
+      static char const word_beg_no_bk[] = "(^|[^[:alnum:]_])(";
+      static char const word_end_no_bk[] = ")([^[:alnum:]_]|$)";
+      static char const line_beg_bk[] = "^\\(";
+      static char const line_end_bk[] = "\\)$";
+      static char const word_beg_bk[] = "\\(^\\|[^[:alnum:]_]\\)\\(";
+      static char const word_end_bk[] = "\\)\\([^[:alnum:]_]\\|$\\)";
+      int bk = !(syntax_bits & RE_NO_BK_PARENS);
+      char *n = xmalloc (sizeof word_beg_bk - 1 + size + sizeof word_end_bk);
+
+      strcpy (n, match_lines ? (bk ? line_beg_bk : line_beg_no_bk)
+                             : (bk ? word_beg_bk : word_beg_no_bk));
+      size_t total = strlen (n);
+      memcpy (n + total, pattern, size);
+      total += size;
+      strcpy (n + total, match_lines ? (bk ? line_end_bk : line_end_no_bk)
+                                     : (bk ? word_end_bk : word_end_no_bk));
+      total += strlen (n + total);
+      pattern = motif = n;
+      size = total;
+    }
+  else
+    motif = NULL;
+
+  dfacomp (pattern, size, dfa, 1);
+  kwsmusts ();
+
+  free (motif);
+}
+
+size_t
+EGexecute (char *buf, size_t size, size_t *match_size,
+           char const *start_ptr)
+{
+  char const *buflim, *beg, *end, *ptr, *match, *best_match, *mb_start;
+  char eol = eolbyte;
+  regoff_t start;
+  size_t len, best_len;
+  struct kwsmatch kwsm;
+  size_t i;
+  struct dfa *superset = dfasuperset (dfa);
+  bool dfafast = dfaisfast (dfa);
+
+  mb_start = buf;
+  buflim = buf + size;
+
+  for (beg = end = buf; end < buflim; beg = end)
+    {
+      end = buflim;
+
+      if (!start_ptr)
+        {
+          char const *next_beg, *dfa_beg = beg;
+          size_t count = 0;
+          bool exact_kwset_match = false;
+          bool backref = false;
+
+          /* Try matching with KWset, if it's defined.  */
+          if (kwset)
+            {
+              char const *prev_beg;
+
+              /* Find a possible match using the KWset matcher.  */
+              size_t offset = kwsexec (kwset, beg - begline,
+                                       buflim - beg + begline, &kwsm, true);
+              if (offset == (size_t) -1)
+                goto failure;
+              match = beg + offset;
+              prev_beg = beg;
+
+              /* Narrow down to the line containing the possible match.  */
+              beg = memrchr (buf, eol, match - buf);
+              beg = beg ? beg + 1 : buf;
+              dfa_beg = beg;
+
+              /* Determine the end pointer to give the DFA next.  Typically
+                 this is after the first newline after MATCH; but if the KWset
+                 match is not exact, the DFA is fast, and the offset from
+                 PREV_BEG is less than 64 or (MATCH - PREV_BEG), this is the
+                 greater of the latter two values; this temporarily prefers
+                 the DFA to KWset.  */
+              exact_kwset_match = kwsm.index < kwset_exact_matches;
+              end = ((exact_kwset_match || !dfafast
+                      || MAX (16, match - beg) < (match - prev_beg) >> 2)
+                     ? match
+                     : MAX (16, match - beg) < (buflim - prev_beg) >> 2
+                     ? prev_beg + 4 * MAX (16, match - beg)
+                     : buflim);
+              end = memchr (end, eol, buflim - end);
+              end = end ? end + 1 : buflim;
+
+              if (exact_kwset_match)
+                {
+                  if (MB_CUR_MAX == 1 || localeinfo.using_utf8)
+                    goto success;
+                  if (mb_start < beg)
+                    mb_start = beg;
+                  if (mb_goback (&mb_start, match, buflim) == 0)
+                    goto success;
+                  /* The matched line starts in the middle of a multibyte
+                     character.  Perform the DFA search starting from the
+                     beginning of the next character.  */
+                  dfa_beg = mb_start;
+                }
+            }
+
+          /* Try matching with the superset of DFA, if it's defined.  */
+          if (superset && !exact_kwset_match)
+            {
+              /* Keep using the superset while it reports multiline
+                 potential matches; this is more likely to be fast
+                 than falling back to KWset would be.  */
+              next_beg = dfaexec (superset, dfa_beg, (char *) end, 0,
+                                  &count, NULL);
+              if (next_beg == NULL || next_beg == end)
+                continue;
+
+              /* Narrow down to the line we've found.  */
+              if (count != 0)
+                {
+                  beg = memrchr (buf, eol, next_beg - buf);
+                  beg++;
+                  dfa_beg = beg;
+                }
+              end = memchr (next_beg, eol, buflim - next_beg);
+              end = end ? end + 1 : buflim;
+
+              count = 0;
+            }
+
+          /* Try matching with DFA.  */
+          next_beg = dfaexec (dfa, dfa_beg, (char *) end, 0, &count, &backref);
+
+          /* If there's no match, or if we've matched the sentinel,
+             we're done.  */
+          if (next_beg == NULL || next_beg == end)
+            continue;
+
+          /* Narrow down to the line we've found.  */
+          if (count != 0)
+            {
+              beg = memrchr (buf, eol, next_beg - buf);
+              beg++;
+            }
+          end = memchr (next_beg, eol, buflim - next_beg);
+          end = end ? end + 1 : buflim;
+
+          /* Successful, no backreferences encountered! */
+          if (!backref)
+            goto success;
+          ptr = beg;
+        }
+      else
+        {
+          /* We are looking for the leftmost (then longest) exact match.
+             We will go through the outer loop only once.  */
+          ptr = start_ptr;
+        }
+
+      /* If the "line" is longer than the maximum regexp offset,
+         die as if we've run out of memory.  */
+      if (TYPE_MAXIMUM (regoff_t) < end - beg - 1)
+        xalloc_die ();
+
+      /* Run the possible match through Regex.  */
+      best_match = end;
+      best_len = 0;
+      for (i = 0; i < pcount; i++)
+        {
+          /* This is static because of a BRAIN-DEAD Q@#%!# library
+             interface in regex.c, as later calls reuse the
+             dynamically allocated storage that REGS members point at
+             and the API provides no way to free this storage.
+             If grep is ever made multithreaded, REGS would have to be
+             per-thread or the library API changed or the library
+             encapsulation violated.  */
+          static struct re_registers regs;
+
+          patterns[i].not_eol = 0;
+          patterns[i].newline_anchor = eolbyte == '\n';
+          start = re_search (&patterns[i], beg, end - beg - 1,
+                             ptr - beg, end - ptr - 1, &regs);
+          if (start < -1)
+            xalloc_die ();
+          else if (0 <= start)
+            {
+              len = regs.end[0] - start;
+              match = beg + start;
+              if (match > best_match)
+                continue;
+              if (start_ptr && !match_words)
+                goto assess_pattern_match;
+              if ((!match_lines && !match_words)
+                  || (match_lines && len == end - ptr - 1))
+                {
+                  match = ptr;
+                  len = end - ptr;
+                  goto assess_pattern_match;
+                }
+              /* If -w and not -x, check whether the match aligns with
+                 word boundaries.  Do this iteratively because:
+                 (a) the line may contain more than one occurrence of the
+                 pattern, and
+                 (b) Several alternatives in the pattern might be valid at a
+                 given point, and we may need to consider a shorter one to
+                 find a word boundary.  */
+              if (!match_lines && match_words)
+                while (match <= best_match)
+                  {
+                    regoff_t shorter_len = 0;
+                    if (!wordchar (mb_prev_wc (beg, match, end - 1))
+                        && !wordchar (mb_next_wc (match + len, end - 1)))
+                      goto assess_pattern_match;
+                    if (len > 0)
+                      {
+                        /* Try a shorter length anchored at the same place. */
+                        --len;
+                        patterns[i].not_eol = 1;
+                        shorter_len = re_match (&patterns[i], beg,
+                                                match + len - ptr, match - beg,
+                                                &regs);
+                        if (shorter_len < -1)
+                          xalloc_die ();
+                      }
+                    if (0 < shorter_len)
+                      len = shorter_len;
+                    else
+                      {
+                        /* Try looking further on. */
+                        if (match == end - 1)
+                          break;
+                        match++;
+                        patterns[i].not_eol = 0;
+                        start = re_search (&patterns[i], beg, end - beg - 1,
+                                           match - beg, end - match - 1,
+                                           &regs);
+                        if (start < 0)
+                          {
+                            if (start < -1)
+                              xalloc_die ();
+                            break;
+                          }
+                        len = regs.end[0] - start;
+                        match = beg + start;
+                      }
+                  } /* while (match <= best_match) */
+              continue;
+            assess_pattern_match:
+              if (!start_ptr)
+                {
+                  /* Good enough for a non-exact match.
+                     No need to look at further patterns, if any.  */
+                  goto success;
+                }
+              if (match < best_match || (match == best_match && len > best_len))
+                {
+                  /* Best exact match:  leftmost, then longest.  */
+                  best_match = match;
+                  best_len = len;
+                }
+            } /* if re_search >= 0 */
+        } /* for Regex patterns.  */
+        if (best_match < end)
+          {
+            /* We have found an exact match.  We were just
+               waiting for the best one (leftmost then longest).  */
+            beg = best_match;
+            len = best_len;
+            goto success_in_len;
+          }
+    } /* for (beg = end ..) */
+
+ failure:
+  return -1;
+
+ success:
+  len = end - beg;
+ success_in_len:;
+  size_t off = beg - buf;
+  *match_size = len;
+  return off;
+}
+/* dosbuf.c
+   Copyright (C) 1992, 1997-2002, 2004-2016 Free Software Foundation, Inc.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 3, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA
+   02110-1301, USA.  */
+
+/* Messy DOS-specific code for correctly treating binary, Unix text
+   and DOS text files.
+
+   This has several aspects:
+
+     * Guessing the file type (unless the user tells us);
+     * Stripping CR characters from DOS text files (otherwise regex
+       functions won't work correctly);
+     * Reporting correct byte count with -b for any kind of file.
+
+*/
+
+#include <config.h>
+
+typedef enum {
+  UNKNOWN, DOS_BINARY, DOS_TEXT, UNIX_TEXT
+} File_type;
+
+struct dos_map {
+  off_t pos;	/* position in buffer passed to matcher */
+  off_t add;	/* how much to add when reporting char position */
+};
+
+static int       dos_report_unix_offset = 0;
+
+static File_type dos_file_type     = UNKNOWN;
+static File_type dos_use_file_type = UNKNOWN;
+static off_t     dos_stripped_crs  = 0;
+static struct dos_map *dos_pos_map;
+static int       dos_pos_map_size  = 0;
+static int       dos_pos_map_used  = 0;
+static int       inp_map_idx = 0, out_map_idx = 1;
+
+/* Set default DOS file type to binary.  */
+static void
+dos_binary (void)
+{
+  if (O_BINARY)
+    dos_use_file_type = DOS_BINARY;
+}
+
+/* Tell DOS routines to report Unix offset.  */
+static void
+dos_unix_byte_offsets (void)
+{
+  if (O_BINARY)
+    dos_report_unix_offset = 1;
+}
+
+/* Guess DOS file type by looking at its contents.  */
+static File_type
+guess_type (char *buf, size_t buflen)
+{
+  int crlf_seen = 0;
+  char *bp = buf;
+
+  while (buflen--)
+    {
+      /* Treat a file as binary if it has a NUL character.  */
+      if (!*bp)
+        return DOS_BINARY;
+
+      /* CR before LF means DOS text file (unless we later see
+         binary characters).  */
+      else if (*bp == '\r' && buflen && bp[1] == '\n')
+        crlf_seen = 1;
+
+      bp++;
+    }
+
+  return crlf_seen ? DOS_TEXT : UNIX_TEXT;
+}
+
+/* Convert external DOS file representation to internal.
+   Return the count of bytes left in the buffer.
+   Build table to map character positions when reporting byte counts.  */
+static size_t
+undossify_input (char *buf, size_t buflen)
+{
+  if (! O_BINARY)
+    return buflen;
+
+  size_t bytes_left = 0;
+
+  if (totalcc == 0)
+    {
+      /* New file: forget everything we knew about character
+         position mapping table and file type.  */
+      inp_map_idx = 0;
+      out_map_idx = 1;
+      dos_pos_map_used = 0;
+      dos_stripped_crs = 0;
+      dos_file_type = dos_use_file_type;
+    }
+
+  /* Guess if this file is binary, unless we already know that.  */
+  if (dos_file_type == UNKNOWN)
+    dos_file_type = guess_type(buf, buflen);
+
+  /* If this file is to be treated as DOS Text, strip the CR characters
+     and maybe build the table for character position mapping on output.  */
+  if (dos_file_type == DOS_TEXT)
+    {
+      char   *destp   = buf;
+
+      while (buflen--)
+        {
+          if (*buf != '\r')
+            {
+              *destp++ = *buf++;
+              bytes_left++;
+            }
+          else
+            {
+              buf++;
+              if (out_byte && !dos_report_unix_offset)
+                {
+                  dos_stripped_crs++;
+                  while (buflen && *buf == '\r')
+                    {
+                      dos_stripped_crs++;
+                      buflen--;
+                      buf++;
+                    }
+                  if (inp_map_idx >= dos_pos_map_size - 1)
+                    {
+                      dos_pos_map_size = inp_map_idx ? inp_map_idx * 2 : 1000;
+                      dos_pos_map = xrealloc(dos_pos_map,
+                                             dos_pos_map_size *
+                                             sizeof(struct dos_map));
+                    }
+
+                  if (!inp_map_idx)
+                    {
+                      /* Add sentinel entry.  */
+                      dos_pos_map[inp_map_idx].pos = 0;
+                      dos_pos_map[inp_map_idx++].add = 0;
+
+                      /* Initialize first real entry.  */
+                      dos_pos_map[inp_map_idx].add = 0;
+                    }
+
+                  /* Put the new entry.  If the stripped CR characters
+                     precede a Newline (the usual case), pretend that
+                     they were found *after* the Newline.  This makes
+                     displayed byte offsets more reasonable in some
+                     cases, and fits better the intuitive notion that
+                     the line ends *before* the CR, not *after* it.  */
+                  inp_map_idx++;
+                  dos_pos_map[inp_map_idx-1].pos =
+                    (*buf == '\n' ? destp + 1 : destp ) - bufbeg + totalcc;
+                  dos_pos_map[inp_map_idx].add = dos_stripped_crs;
+                  dos_pos_map_used = inp_map_idx;
+
+                  /* The following will be updated on the next pass.  */
+                  dos_pos_map[inp_map_idx].pos = destp - bufbeg + totalcc + 1;
+                }
+            }
+        }
+
+      return bytes_left;
+    }
+
+  return buflen;
+}
+
+/* Convert internal byte count into external.  */
+static off_t
+dossified_pos (off_t byteno)
+{
+  if (! O_BINARY)
+    return byteno;
+
+  off_t pos_lo;
+  off_t pos_hi;
+
+  if (dos_file_type != DOS_TEXT || dos_report_unix_offset)
+    return byteno;
+
+  /* Optimization: usually the file will be scanned sequentially.
+     So in most cases, this byte position will be found in the
+     table near the previous one, as recorded in 'out_map_idx'.  */
+  pos_lo = dos_pos_map[out_map_idx-1].pos;
+  pos_hi = dos_pos_map[out_map_idx].pos;
+
+  /* If the initial guess failed, search up or down, as
+     appropriate, beginning with the previous place.  */
+  if (byteno >= pos_hi)
+    {
+      out_map_idx++;
+      while (out_map_idx < dos_pos_map_used
+             && byteno >= dos_pos_map[out_map_idx].pos)
+        out_map_idx++;
+    }
+
+  else if (byteno < pos_lo)
+    {
+      out_map_idx--;
+      while (out_map_idx > 1 && byteno < dos_pos_map[out_map_idx-1].pos)
+        out_map_idx--;
+    }
+
+  return byteno + dos_pos_map[out_map_idx].add;
+}
+/* grep.c - main driver file for grep.
+   Copyright (C) 1992, 1997-2002, 2004-2016 Free Software Foundation, Inc.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 3, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA
+   02110-1301, USA.  */
+
+/* Written July 1992 by Mike Haertel.  */
+
+#include <config.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <wchar.h>
+#include <fcntl.h>
+#include <inttypes.h>
+#include <stdarg.h>
+#include <stdio.h>
+#include "system.h"
+
+#include "argmatch.h"
+#include "c-ctype.h"
+#include "closeout.h"
+#include "colorize.h"
+#include "error.h"
+#include "exclude.h"
+#include "exitfail.h"
+#include "fcntl-safer.h"
+#include "fts_.h"
+#include "getopt.h"
+#include "getprogname.h"
+#include "grep.h"
+#include "intprops.h"
+#include "propername.h"
+#include "quote.h"
+#include "safe-read.h"
+#include "search.h"
+#include "version-etc.h"
+#include "xalloc.h"
+#include "xstrtol.h"
+
+#define SEP_CHAR_SELECTED ':'
+#define SEP_CHAR_REJECTED '-'
+#define SEP_STR_GROUP    "--"
+
+#define AUTHORS \
+  proper_name ("Mike Haertel"), \
+  _("others, see <http://git.sv.gnu.org/cgit/grep.git/tree/AUTHORS>")
+
+/* When stdout is connected to a regular file, save its stat
+   information here, so that we can automatically skip it, thus
+   avoiding a potential (racy) infinite loop.  */
+static struct stat out_stat;
+
+/* if non-zero, display usage information and exit */
+static int show_help;
+
+/* Print the version on standard output and exit.  */
+static bool show_version;
+
+/* Suppress diagnostics for nonexistent or unreadable files.  */
+static bool suppress_errors;
+
+/* If nonzero, use color markers.  */
+static int color_option;
+
+/* Show only the part of a line matching the expression. */
+static bool only_matching;
+
+/* If nonzero, make sure first content char in a line is on a tab stop. */
+static bool align_tabs;
+
+/* See below */
+struct FL_pair
+  {
+    char const *filename;
+    size_t lineno;
+  };
+
+/* A list of lineno,filename pairs corresponding to -f FILENAME
+   arguments. Since we store the concatenation of all patterns in
+   a single array, KEYS, be they from the command line via "-e PAT"
+   or read from one or more -f-specified FILENAMES.  Given this
+   invocation, grep -f <(seq 5) -f <(seq 2) -f <(seq 3) FILE, there
+   will be three entries in LF_PAIR: {1, x} {6, y} {8, z}, where
+   x, y and z are just place-holders for shell-generated names.  */
+static struct FL_pair *fl_pair;
+static size_t n_fl_pair_slots;
+/* Count not only -f-specified files, but also individual -e operands
+   and any command-line argument that serves as a regular expression.  */
+static size_t n_pattern_files;
+
+/* Given the concatenation of all patterns, one per line, be they
+   specified via -e, a lone command-line argument or -f, this is the
+   number of the first line of each entity, in that concatenation.
+   It is advanced by fl_add and, when needed, used in pattern_file_name
+   to derive a file-relative line number.  */
+static uintmax_t patfile_lineno = 1;
+
+/* Return the number of newline bytes in BUF starting at offset BEG
+   and up to and not including offset END.  */
+static size_t _GL_ATTRIBUTE_PURE
+count_nl_bytes (char const *buf, size_t beg, size_t end)
+{
+  char const *p = buf + beg;
+  char const *end_p = buf + end;
+  uintmax_t n = 0;
+  while (true)
+    {
+      p = memchr (p, '\n', end_p - p);
+      if (!p)
+        break;
+      p++;
+      n++;
+    }
+  return n;
+}
+
+/* Append a FILENAME,line-number pair to FL_PAIR.  The line number we save
+   with FILENAME is the initial value of the global PATFILE_LINENO.
+   PATFILE_LINENO is then incremented by the number of newlines in BUF
+   from offset BEG up to but not including offset END.  */
+static void
+fl_add (char const *buf, size_t beg, size_t end, char const *filename)
+{
+  if (n_fl_pair_slots <= n_pattern_files)
+    fl_pair = x2nrealloc (fl_pair, &n_fl_pair_slots, sizeof *fl_pair);
+
+  fl_pair[n_pattern_files].lineno = patfile_lineno;
+  fl_pair[n_pattern_files].filename = filename;
+  n_pattern_files++;
+  patfile_lineno += count_nl_bytes (buf, beg, end);
+}
+
+/* Map the line number, LINENO, of one of the input patterns to the
+   name of the file from which it came.  If it was read from stdin
+   or if it was specified on the command line, return "-".  */
+char const * _GL_ATTRIBUTE_PURE
+pattern_file_name (size_t lineno, size_t *new_lineno)
+{
+  size_t i;
+  for (i = 1; i < n_pattern_files; i++)
+    {
+      if (lineno < fl_pair[i].lineno)
+        break;
+    }
+
+  *new_lineno = lineno - fl_pair[i - 1].lineno + 1;
+  return fl_pair[i - 1].filename;
+}
+
+#if HAVE_ASAN
+/* Record the starting address and length of the sole poisoned region,
+   so that we can unpoison it later, just before each following read.  */
+static void const *poison_buf;
+static size_t poison_len;
+
+static void
+clear_asan_poison (void)
+{
+  if (poison_buf)
+    __asan_unpoison_memory_region (poison_buf, poison_len);
+}
+
+static void
+asan_poison (void const *addr, size_t size)
+{
+  poison_buf = addr;
+  poison_len = size;
+
+  __asan_poison_memory_region (poison_buf, poison_len);
+}
+#else
+static void clear_asan_poison (void) { }
+static void asan_poison (void const volatile *addr, size_t size) { }
+#endif
+
+/* The group separator used when context is requested. */
+static const char *group_separator = SEP_STR_GROUP;
+
+/* The context and logic for choosing default --color screen attributes
+   (foreground and background colors, etc.) are the following.
+      -- There are eight basic colors available, each with its own
+         nominal luminosity to the human eye and foreground/background
+         codes (black [0 %, 30/40], blue [11 %, 34/44], red [30 %, 31/41],
+         magenta [41 %, 35/45], green [59 %, 32/42], cyan [70 %, 36/46],
+         yellow [89 %, 33/43], and white [100 %, 37/47]).
+      -- Sometimes, white as a background is actually implemented using
+         a shade of light gray, so that a foreground white can be visible
+         on top of it (but most often not).
+      -- Sometimes, black as a foreground is actually implemented using
+         a shade of dark gray, so that it can be visible on top of a
+         background black (but most often not).
+      -- Sometimes, more colors are available, as extensions.
+      -- Other attributes can be selected/deselected (bold [1/22],
+         underline [4/24], standout/inverse [7/27], blink [5/25], and
+         invisible/hidden [8/28]).  They are sometimes implemented by
+         using colors instead of what their names imply; e.g., bold is
+         often achieved by using brighter colors.  In practice, only bold
+         is really available to us, underline sometimes being mapped by
+         the terminal to some strange color choice, and standout best
+         being left for use by downstream programs such as less(1).
+      -- We cannot assume that any of the extensions or special features
+         are available for the purpose of choosing defaults for everyone.
+      -- The most prevalent default terminal backgrounds are pure black
+         and pure white, and are not necessarily the same shades of
+         those as if they were selected explicitly with SGR sequences.
+         Some terminals use dark or light pictures as default background,
+         but those are covered over by an explicit selection of background
+         color with an SGR sequence; their users will appreciate their
+         background pictures not be covered like this, if possible.
+      -- Some uses of colors attributes is to make some output items
+         more understated (e.g., context lines); this cannot be achieved
+         by changing the background color.
+      -- For these reasons, the grep color defaults should strive not
+         to change the background color from its default, unless it's
+         for a short item that should be highlighted, not understated.
+      -- The grep foreground color defaults (without an explicitly set
+         background) should provide enough contrast to be readable on any
+         terminal with either a black (dark) or white (light) background.
+         This only leaves red, magenta, green, and cyan (and their bold
+         counterparts) and possibly bold blue.  */
+/* The color strings used for matched text.
+   The user can overwrite them using the deprecated
+   environment variable GREP_COLOR or the new GREP_COLORS.  */
+static const char *selected_match_color = "01;31";	/* bold red */
+static const char *context_match_color  = "01;31";	/* bold red */
+
+/* Other colors.  Defaults look damn good.  */
+static const char *filename_color = "35";	/* magenta */
+static const char *line_num_color = "32";	/* green */
+static const char *byte_num_color = "32";	/* green */
+static const char *sep_color      = "36";	/* cyan */
+static const char *selected_line_color = "";	/* default color pair */
+static const char *context_line_color  = "";	/* default color pair */
+
+/* Select Graphic Rendition (SGR, "\33[...m") strings.  */
+/* Also Erase in Line (EL) to Right ("\33[K") by default.  */
+/*    Why have EL to Right after SGR?
+         -- The behavior of line-wrapping when at the bottom of the
+            terminal screen and at the end of the current line is often
+            such that a new line is introduced, entirely cleared with
+            the current background color which may be different from the
+            default one (see the boolean back_color_erase terminfo(5)
+            capability), thus scrolling the display by one line.
+            The end of this new line will stay in this background color
+            even after reverting to the default background color with
+            "\33[m', unless it is explicitly cleared again with "\33[K"
+            (which is the behavior the user would instinctively expect
+            from the whole thing).  There may be some unavoidable
+            background-color flicker at the end of this new line because
+            of this (when timing with the monitor's redraw is just right).
+         -- The behavior of HT (tab, "\t") is usually the same as that of
+            Cursor Forward Tabulation (CHT) with a default parameter
+            of 1 ("\33[I"), i.e., it performs pure movement to the next
+            tab stop, without any clearing of either content or screen
+            attributes (including background color); try
+               printf 'asdfqwerzxcv\rASDF\tZXCV\n'
+            in a bash(1) shell to demonstrate this.  This is not what the
+            user would instinctively expect of HT (but is ok for CHT).
+            The instinctive behavior would include clearing the terminal
+            cells that are skipped over by HT with blank cells in the
+            current screen attributes, including background color;
+            the boolean dest_tabs_magic_smso terminfo(5) capability
+            indicates this saner behavior for HT, but only some rare
+            terminals have it (although it also indicates a special
+            glitch with standout mode in the Teleray terminal for which
+            it was initially introduced).  The remedy is to add "\33K"
+            after each SGR sequence, be it START (to fix the behavior
+            of any HT after that before another SGR) or END (to fix the
+            behavior of an HT in default background color that would
+            follow a line-wrapping at the bottom of the screen in another
+            background color, and to complement doing it after START).
+            Piping grep's output through a pager such as less(1) avoids
+            any HT problems since the pager performs tab expansion.
+
+      Generic disadvantages of this remedy are:
+         -- Some very rare terminals might support SGR but not EL (nobody
+            will use "grep --color" on a terminal that does not support
+            SGR in the first place).
+         -- Having these extra control sequences might somewhat complicate
+            the task of any program trying to parse "grep --color"
+            output in order to extract structuring information from it.
+      A specific disadvantage to doing it after SGR START is:
+         -- Even more possible background color flicker (when timing
+            with the monitor's redraw is just right), even when not at the
+            bottom of the screen.
+      There are no additional disadvantages specific to doing it after
+      SGR END.
+
+      It would be impractical for GNU grep to become a full-fledged
+      terminal program linked against ncurses or the like, so it will
+      not detect terminfo(5) capabilities.  */
+static const char *sgr_start = "\33[%sm\33[K";
+static const char *sgr_end   = "\33[m\33[K";
+
+/* SGR utility functions.  */
+static void
+pr_sgr_start (char const *s)
+{
+  if (*s)
+    print_start_colorize (sgr_start, s);
+}
+static void
+pr_sgr_end (char const *s)
+{
+  if (*s)
+    print_end_colorize (sgr_end);
+}
+static void
+pr_sgr_start_if (char const *s)
+{
+  if (color_option)
+    pr_sgr_start (s);
+}
+static void
+pr_sgr_end_if (char const *s)
+{
+  if (color_option)
+    pr_sgr_end (s);
+}
+
+struct color_cap
+  {
+    const char *name;
+    const char **var;
+    void (*fct) (void);
+  };
+
+static void
+color_cap_mt_fct (void)
+{
+  /* Our caller just set selected_match_color.  */
+  context_match_color = selected_match_color;
+}
+
+static void
+color_cap_rv_fct (void)
+{
+  /* By this point, it was 1 (or already -1).  */
+  color_option = -1;  /* That's still != 0.  */
+}
+
+static void
+color_cap_ne_fct (void)
+{
+  sgr_start = "\33[%sm";
+  sgr_end   = "\33[m";
+}
+
+/* For GREP_COLORS.  */
+static const struct color_cap color_dict[] =
+  {
+    { "mt", &selected_match_color, color_cap_mt_fct }, /* both ms/mc */
+    { "ms", &selected_match_color, NULL }, /* selected matched text */
+    { "mc", &context_match_color,  NULL }, /* context matched text */
+    { "fn", &filename_color,       NULL }, /* filename */
+    { "ln", &line_num_color,       NULL }, /* line number */
+    { "bn", &byte_num_color,       NULL }, /* byte (sic) offset */
+    { "se", &sep_color,            NULL }, /* separator */
+    { "sl", &selected_line_color,  NULL }, /* selected lines */
+    { "cx", &context_line_color,   NULL }, /* context lines */
+    { "rv", NULL,                  color_cap_rv_fct }, /* -v reverses sl/cx */
+    { "ne", NULL,                  color_cap_ne_fct }, /* no EL on SGR_* */
+    { NULL, NULL,                  NULL }
+  };
+
+/* Saved errno value from failed output functions on stdout.  */
+static int stdout_errno;
+
+static void
+putchar_errno (int c)
+{
+  if (putchar (c) < 0)
+    stdout_errno = errno;
+}
+
+static void
+fputs_errno (char const *s)
+{
+  if (fputs (s, stdout) < 0)
+    stdout_errno = errno;
+}
+
+static void _GL_ATTRIBUTE_FORMAT_PRINTF (1, 2)
+printf_errno (char const *format, ...)
+{
+  va_list ap;
+  va_start (ap, format);
+  if (vfprintf (stdout, format, ap) < 0)
+    stdout_errno = errno;
+  va_end (ap);
+}
+
+static void
+fwrite_errno (void const *ptr, size_t size, size_t nmemb)
+{
+  if (fwrite (ptr, size, nmemb, stdout) != nmemb)
+    stdout_errno = errno;
+}
+
+static void
+fflush_errno (void)
+{
+  if (fflush (stdout) != 0)
+    stdout_errno = errno;
+}
+
+static struct exclude *excluded_patterns[2];
+static struct exclude *excluded_directory_patterns[2];
+/* Short options.  */
+static char const short_options[] =
+"0123456789A:B:C:D:EFGHIPTUVX:abcd:e:f:hiLlm:noqRrsuvwxyZz";
+
+/* Non-boolean long options that have no corresponding short equivalents.  */
+enum
+{
+  BINARY_FILES_OPTION = CHAR_MAX + 1,
+  COLOR_OPTION,
+  EXCLUDE_DIRECTORY_OPTION,
+  EXCLUDE_OPTION,
+  EXCLUDE_FROM_OPTION,
+  GROUP_SEPARATOR_OPTION,
+  INCLUDE_OPTION,
+  LINE_BUFFERED_OPTION,
+  LABEL_OPTION
+};
+
+/* Long options equivalences. */
+static struct option const long_options[] =
+{
+  {"basic-regexp",    no_argument, NULL, 'G'},
+  {"extended-regexp", no_argument, NULL, 'E'},
+  {"fixed-regexp",    no_argument, NULL, 'F'},
+  {"fixed-strings",   no_argument, NULL, 'F'},
+  {"perl-regexp",     no_argument, NULL, 'P'},
+  {"after-context", required_argument, NULL, 'A'},
+  {"before-context", required_argument, NULL, 'B'},
+  {"binary-files", required_argument, NULL, BINARY_FILES_OPTION},
+  {"byte-offset", no_argument, NULL, 'b'},
+  {"context", required_argument, NULL, 'C'},
+  {"color", optional_argument, NULL, COLOR_OPTION},
+  {"colour", optional_argument, NULL, COLOR_OPTION},
+  {"count", no_argument, NULL, 'c'},
+  {"devices", required_argument, NULL, 'D'},
+  {"directories", required_argument, NULL, 'd'},
+  {"exclude", required_argument, NULL, EXCLUDE_OPTION},
+  {"exclude-from", required_argument, NULL, EXCLUDE_FROM_OPTION},
+  {"exclude-dir", required_argument, NULL, EXCLUDE_DIRECTORY_OPTION},
+  {"file", required_argument, NULL, 'f'},
+  {"files-with-matches", no_argument, NULL, 'l'},
+  {"files-without-match", no_argument, NULL, 'L'},
+  {"group-separator", required_argument, NULL, GROUP_SEPARATOR_OPTION},
+  {"help", no_argument, &show_help, 1},
+  {"include", required_argument, NULL, INCLUDE_OPTION},
+  {"ignore-case", no_argument, NULL, 'i'},
+  {"initial-tab", no_argument, NULL, 'T'},
+  {"label", required_argument, NULL, LABEL_OPTION},
+  {"line-buffered", no_argument, NULL, LINE_BUFFERED_OPTION},
+  {"line-number", no_argument, NULL, 'n'},
+  {"line-regexp", no_argument, NULL, 'x'},
+  {"max-count", required_argument, NULL, 'm'},
+
+  {"no-filename", no_argument, NULL, 'h'},
+  {"no-group-separator", no_argument, NULL, GROUP_SEPARATOR_OPTION},
+  {"no-messages", no_argument, NULL, 's'},
+  {"null", no_argument, NULL, 'Z'},
+  {"null-data", no_argument, NULL, 'z'},
+  {"only-matching", no_argument, NULL, 'o'},
+  {"quiet", no_argument, NULL, 'q'},
+  {"recursive", no_argument, NULL, 'r'},
+  {"dereference-recursive", no_argument, NULL, 'R'},
+  {"regexp", required_argument, NULL, 'e'},
+  {"invert-match", no_argument, NULL, 'v'},
+  {"silent", no_argument, NULL, 'q'},
+  {"text", no_argument, NULL, 'a'},
+  {"binary", no_argument, NULL, 'U'},
+  {"unix-byte-offsets", no_argument, NULL, 'u'},
+  {"version", no_argument, NULL, 'V'},
+  {"with-filename", no_argument, NULL, 'H'},
+  {"word-regexp", no_argument, NULL, 'w'},
+  {0, 0, 0, 0}
+};
+
+/* Define flags declared in grep.h. */
+bool match_icase;
+bool match_words;
+bool match_lines;
+char eolbyte;
+
+static char const *matcher;
+
+/* For error messages. */
+/* The input file name, or (if standard input) "-" or a --label argument.  */
+static char const *filename;
+/* Omit leading "./" from file names in diagnostics.  */
+static bool omit_dot_slash;
+static bool errseen;
+
+/* True if output from the current input file has been suppressed
+   because an output line had an encoding error.  */
+static bool encoding_error_output;
+
+enum directories_type
+  {
+    READ_DIRECTORIES = 2,
+    RECURSE_DIRECTORIES,
+    SKIP_DIRECTORIES
+  };
+
+/* How to handle directories.  */
+static char const *const directories_args[] =
+{
+  "read", "recurse", "skip", NULL
+};
+static enum directories_type const directories_types[] =
+{
+  READ_DIRECTORIES, RECURSE_DIRECTORIES, SKIP_DIRECTORIES
+};
+ARGMATCH_VERIFY (directories_args, directories_types);
+
+static enum directories_type directories = READ_DIRECTORIES;
+
+enum { basic_fts_options = FTS_CWDFD | FTS_NOSTAT | FTS_TIGHT_CYCLE_CHECK };
+static int fts_options = basic_fts_options | FTS_COMFOLLOW | FTS_PHYSICAL;
+
+/* How to handle devices. */
+static enum
+  {
+    READ_COMMAND_LINE_DEVICES,
+    READ_DEVICES,
+    SKIP_DEVICES
+  } devices = READ_COMMAND_LINE_DEVICES;
+
+static bool grepfile (int, char const *, bool, bool);
+static bool grepdesc (int, bool);
+
+static void dos_binary (void);
+static void dos_unix_byte_offsets (void);
+static size_t undossify_input (char *, size_t);
+
+static bool
+is_device_mode (mode_t m)
+{
+  return S_ISCHR (m) || S_ISBLK (m) || S_ISSOCK (m) || S_ISFIFO (m);
+}
+
+static bool
+skip_devices (bool command_line)
+{
+  return (devices == SKIP_DEVICES
+          || ((devices == READ_COMMAND_LINE_DEVICES) & !command_line));
+}
+
+/* Return if ST->st_size is defined.  Assume the file is not a
+   symbolic link.  */
+static bool
+usable_st_size (struct stat const *st)
+{
+  return S_ISREG (st->st_mode) || S_TYPEISSHM (st) || S_TYPEISTMO (st);
+}
+
+/* Lame substitutes for SEEK_DATA and SEEK_HOLE on platforms lacking them.
+   Do not rely on these finding data or holes if they equal SEEK_SET.  */
+#ifndef SEEK_DATA
+enum { SEEK_DATA = SEEK_SET };
+#endif
+#ifndef SEEK_HOLE
+enum { SEEK_HOLE = SEEK_SET };
+#endif
+
+/* Functions we'll use to search. */
+typedef void (*compile_fp_t) (char const *, size_t);
+typedef size_t (*execute_fp_t) (char *, size_t, size_t *, char const *);
+static compile_fp_t compile;
+static execute_fp_t execute;
+
+/* Like error, but suppress the diagnostic if requested.  */
+static void
+suppressible_error (char const *mesg, int errnum)
+{
+  if (! suppress_errors)
+    error (0, errnum, "%s", mesg);
+  errseen = true;
+}
+
+/* If there has already been a write error, don't bother closing
+   standard output, as that might elicit a duplicate diagnostic.  */
+static void
+clean_up_stdout (void)
+{
+  if (! stdout_errno)
+    close_stdout ();
+}
+
+/* A cast to TYPE of VAL.  Use this when TYPE is a pointer type, VAL
+   is properly aligned for TYPE, and 'gcc -Wcast-align' cannot infer
+   the alignment and would otherwise complain about the cast.  */
+#if 4 < __GNUC__ + (6 <= __GNUC_MINOR__)
+# define CAST_ALIGNED(type, val)                           \
+    ({ __typeof__ (val) val_ = val;                        \
+       _Pragma ("GCC diagnostic push")                     \
+       _Pragma ("GCC diagnostic ignored \"-Wcast-align\"") \
+       (type) val_;                                        \
+       _Pragma ("GCC diagnostic pop")                      \
+    })
+#else
+# define CAST_ALIGNED(type, val) ((type) (val))
+#endif
+
+/* An unsigned type suitable for fast matching.  */
+typedef uintmax_t uword;
+
+/* A mask to test for unibyte characters, with the pattern repeated to
+   fill a uword.  For a multibyte character encoding where
+   all bytes are unibyte characters, this is 0.  For UTF-8, this is
+   0x808080....  For encodings where unibyte characters have no discerned
+   pattern, this is all 1s.  The unsigned char C is a unibyte
+   character if C & UNIBYTE_MASK is zero.  If the uword W is the
+   concatenation of bytes, the bytes are all unibyte characters
+   if W & UNIBYTE_MASK is zero.  */
+static uword unibyte_mask;
+
+static void
+initialize_unibyte_mask (void)
+{
+  /* For each encoding error I that MASK does not already match,
+     accumulate I's most significant 1 bit by ORing it into MASK.
+     Although any 1 bit of I could be used, in practice high-order
+     bits work better.  */
+  unsigned char mask = 0;
+  int ms1b = 1;
+  for (int i = 1; i <= UCHAR_MAX; i++)
+    if ((localeinfo.sbclen[i] != 1) & ! (mask & i))
+      {
+        while (ms1b * 2 <= i)
+          ms1b *= 2;
+        mask |= ms1b;
+      }
+
+  /* Now MASK will detect any encoding-error byte, although it may
+     cry wolf and it may not be optimal.  Build a uword-length mask by
+     repeating MASK.  */
+  uword uword_max = -1;
+  unibyte_mask = uword_max / UCHAR_MAX * mask;
+}
+
+/* Skip the easy bytes in a buffer that is guaranteed to have a sentinel
+   that is not easy, and return a pointer to the first non-easy byte.
+   The easy bytes all have UNIBYTE_MASK off.  */
+static char const * _GL_ATTRIBUTE_PURE
+skip_easy_bytes (char const *buf)
+{
+  /* Search a byte at a time until the pointer is aligned, then a
+     uword at a time until a match is found, then a byte at a time to
+     identify the exact byte.  The uword search may go slightly past
+     the buffer end, but that's benign.  */
+  char const *p;
+  uword const *s;
+  for (p = buf; (uintptr_t) p % sizeof (uword) != 0; p++)
+    if (to_uchar (*p) & unibyte_mask)
+      return p;
+  for (s = CAST_ALIGNED (uword const *, p); ! (*s & unibyte_mask); s++)
+    continue;
+  for (p = (char const *) s; ! (to_uchar (*p) & unibyte_mask); p++)
+    continue;
+  return p;
+}
+
+/* Return true if BUF, of size SIZE, has an encoding error.
+   BUF must be followed by at least sizeof (uword) bytes,
+   the first of which may be modified.  */
+bool
+buf_has_encoding_errors (char *buf, size_t size)
+{
+  if (! unibyte_mask)
+    return false;
+
+  mbstate_t mbs = { 0 };
+  size_t clen;
+
+  buf[size] = -1;
+  for (char const *p = buf; (p = skip_easy_bytes (p)) < buf + size; p += clen)
+    {
+      clen = mbrlen (p, buf + size - p, &mbs);
+      if ((size_t) -2 <= clen)
+        return true;
+    }
+
+  return false;
+}
+
+
+/* Return true if BUF, of size SIZE, has a null byte.
+   BUF must be followed by at least one byte,
+   which may be arbitrarily written to or read from.  */
+static bool
+buf_has_nulls (char *buf, size_t size)
+{
+  buf[size] = 0;
+  return strlen (buf) != size;
+}
+
+/* Return true if a file is known to contain null bytes.
+   SIZE bytes have already been read from the file
+   with descriptor FD and status ST.  */
+static bool
+file_must_have_nulls (size_t size, int fd, struct stat const *st)
+{
+  if (usable_st_size (st))
+    {
+      if (st->st_size <= size)
+        return false;
+
+      /* If the file has holes, it must contain a null byte somewhere.  */
+      if (SEEK_HOLE != SEEK_SET)
+        {
+          off_t cur = size;
+          if (O_BINARY || fd == STDIN_FILENO)
+            {
+              cur = lseek (fd, 0, SEEK_CUR);
+              if (cur < 0)
+                return false;
+            }
+
+          /* Look for a hole after the current location.  */
+          off_t hole_start = lseek (fd, cur, SEEK_HOLE);
+          if (0 <= hole_start)
+            {
+              if (lseek (fd, cur, SEEK_SET) < 0)
+                suppressible_error (filename, errno);
+              if (hole_start < st->st_size)
+                return true;
+            }
+        }
+    }
+
+  return false;
+}
+
+/* Convert STR to a nonnegative integer, storing the result in *OUT.
+   STR must be a valid context length argument; report an error if it
+   isn't.  Silently ceiling *OUT at the maximum value, as that is
+   practically equivalent to infinity for grep's purposes.  */
+static void
+context_length_arg (char const *str, intmax_t *out)
+{
+  switch (xstrtoimax (str, 0, 10, out, ""))
+    {
+    case LONGINT_OK:
+    case LONGINT_OVERFLOW:
+      if (0 <= *out)
+        break;
+      /* Fall through.  */
+    default:
+      error (EXIT_TROUBLE, 0, "%s: %s", str,
+             _("invalid context length argument"));
+    }
+}
+
+/* Return the add_exclude options suitable for excluding a file name.
+   If COMMAND_LINE, it is a command-line file name.  */
+static int
+exclude_options (bool command_line)
+{
+  return EXCLUDE_WILDCARDS | (command_line ? 0 : EXCLUDE_ANCHORED);
+}
+
+/* Return true if the file with NAME should be skipped.
+   If COMMAND_LINE, it is a command-line argument.
+   If IS_DIR, it is a directory.  */
+static bool
+skipped_file (char const *name, bool command_line, bool is_dir)
+{
+  struct exclude **pats;
+  if (! is_dir)
+    pats = excluded_patterns;
+  else if (directories == SKIP_DIRECTORIES)
+    return true;
+  else if (command_line && omit_dot_slash)
+    return false;
+  else
+    pats = excluded_directory_patterns;
+  return pats[command_line] && excluded_file_name (pats[command_line], name);
+}
+
+/* Hairy buffering mechanism for grep.  The intent is to keep
+   all reads aligned on a page boundary and multiples of the
+   page size, unless a read yields a partial page.  */
+
+static char *buffer;		/* Base of buffer. */
+static size_t bufalloc;		/* Allocated buffer size, counting slop. */
+#define INITIAL_BUFSIZE 32768	/* Initial buffer size, not counting slop. */
+static int bufdesc;		/* File descriptor. */
+static char *bufbeg;		/* Beginning of user-visible stuff. */
+static char *buflim;		/* Limit of user-visible stuff. */
+static size_t pagesize;		/* alignment of memory pages */
+static off_t bufoffset;		/* Read offset; defined on regular files.  */
+static off_t after_last_match;	/* Pointer after last matching line that
+                                   would have been output if we were
+                                   outputting characters. */
+static bool skip_nuls;		/* Skip '\0' in data.  */
+static bool skip_empty_lines;	/* Skip empty lines in data.  */
+static bool seek_data_failed;	/* lseek with SEEK_DATA failed.  */
+static uintmax_t totalnl;	/* Total newline count before lastnl. */
+
+/* Return VAL aligned to the next multiple of ALIGNMENT.  VAL can be
+   an integer or a pointer.  Both args must be free of side effects.  */
+#define ALIGN_TO(val, alignment) \
+  ((size_t) (val) % (alignment) == 0 \
+   ? (val) \
+   : (val) + ((alignment) - (size_t) (val) % (alignment)))
+
+/* Add two numbers that count input bytes or lines, and report an
+   error if the addition overflows.  */
+static uintmax_t
+add_count (uintmax_t a, uintmax_t b)
+{
+  uintmax_t sum = a + b;
+  if (sum < a)
+    error (EXIT_TROUBLE, 0, _("input is too large to count"));
+  return sum;
+}
+
+/* Return true if BUF (of size SIZE) is all zeros.  */
+static bool
+all_zeros (char const *buf, size_t size)
+{
+  for (char const *p = buf; p < buf + size; p++)
+    if (*p)
+      return false;
+  return true;
+}
+
+/* Reset the buffer for a new file, returning false if we should skip it.
+   Initialize on the first time through. */
+static bool
+reset (int fd, struct stat const *st)
+{
+  bufbeg = buflim = ALIGN_TO (buffer + 1, pagesize);
+  bufbeg[-1] = eolbyte;
+  bufdesc = fd;
+
+  if (S_ISREG (st->st_mode))
+    {
+      if (fd != STDIN_FILENO)
+        bufoffset = 0;
+      else
+        {
+          bufoffset = lseek (fd, 0, SEEK_CUR);
+          if (bufoffset < 0)
+            {
+              suppressible_error (_("lseek failed"), errno);
+              return false;
+            }
+        }
+    }
+  return true;
+}
+
+/* Read new stuff into the buffer, saving the specified
+   amount of old stuff.  When we're done, 'bufbeg' points
+   to the beginning of the buffer contents, and 'buflim'
+   points just after the end.  Return false if there's an error.  */
+static bool
+fillbuf (size_t save, struct stat const *st)
+{
+  size_t fillsize;
+  bool cc = true;
+  char *readbuf;
+  size_t readsize;
+
+  /* Offset from start of buffer to start of old stuff
+     that we want to save.  */
+  size_t saved_offset = buflim - save - buffer;
+
+  if (pagesize <= buffer + bufalloc - sizeof (uword) - buflim)
+    {
+      readbuf = buflim;
+      bufbeg = buflim - save;
+    }
+  else
+    {
+      size_t minsize = save + pagesize;
+      size_t newsize;
+      size_t newalloc;
+      char *newbuf;
+
+      /* Grow newsize until it is at least as great as minsize.  */
+      for (newsize = bufalloc - pagesize - sizeof (uword);
+           newsize < minsize;
+           newsize *= 2)
+        if ((SIZE_MAX - pagesize - sizeof (uword)) / 2 < newsize)
+          xalloc_die ();
+
+      /* Try not to allocate more memory than the file size indicates,
+         as that might cause unnecessary memory exhaustion if the file
+         is large.  However, do not use the original file size as a
+         heuristic if we've already read past the file end, as most
+         likely the file is growing.  */
+      if (usable_st_size (st))
+        {
+          off_t to_be_read = st->st_size - bufoffset;
+          off_t maxsize_off = save + to_be_read;
+          if (0 <= to_be_read && to_be_read <= maxsize_off
+              && maxsize_off == (size_t) maxsize_off
+              && minsize <= (size_t) maxsize_off
+              && (size_t) maxsize_off < newsize)
+            newsize = maxsize_off;
+        }
+
+      /* Add enough room so that the buffer is aligned and has room
+         for byte sentinels fore and aft, and so that a uword can
+         be read aft.  */
+      newalloc = newsize + pagesize + sizeof (uword);
+
+      newbuf = bufalloc < newalloc ? xmalloc (bufalloc = newalloc) : buffer;
+      readbuf = ALIGN_TO (newbuf + 1 + save, pagesize);
+      bufbeg = readbuf - save;
+      memmove (bufbeg, buffer + saved_offset, save);
+      bufbeg[-1] = eolbyte;
+      if (newbuf != buffer)
+        {
+          free (buffer);
+          buffer = newbuf;
+        }
+    }
+
+  clear_asan_poison ();
+
+  readsize = buffer + bufalloc - sizeof (uword) - readbuf;
+  readsize -= readsize % pagesize;
+
+  while (true)
+    {
+      fillsize = safe_read (bufdesc, readbuf, readsize);
+      if (fillsize == SAFE_READ_ERROR)
+        {
+          fillsize = 0;
+          cc = false;
+        }
+      bufoffset += fillsize;
+
+      if (((fillsize == 0) | !skip_nuls) || !all_zeros (readbuf, fillsize))
+        break;
+      totalnl = add_count (totalnl, fillsize);
+
+      if (SEEK_DATA != SEEK_SET && !seek_data_failed)
+        {
+          /* Solaris SEEK_DATA fails with errno == ENXIO in a hole at EOF.  */
+          off_t data_start = lseek (bufdesc, bufoffset, SEEK_DATA);
+          if (data_start < 0 && errno == ENXIO
+              && usable_st_size (st) && bufoffset < st->st_size)
+            data_start = lseek (bufdesc, 0, SEEK_END);
+
+          if (data_start < 0)
+            seek_data_failed = true;
+          else
+            {
+              totalnl = add_count (totalnl, data_start - bufoffset);
+              bufoffset = data_start;
+            }
+        }
+    }
+
+  fillsize = undossify_input (readbuf, fillsize);
+  buflim = readbuf + fillsize;
+
+  /* Initialize the following word, because skip_easy_bytes and some
+     matchers read (but do not use) those bytes.  This avoids false
+     positive reports of these bytes being used uninitialized.  */
+  memset (buflim, 0, sizeof (uword));
+
+  /* Mark the part of the buffer not filled by the read or set by
+     the above memset call as ASAN-poisoned.  */
+  asan_poison (buflim + sizeof (uword),
+               bufalloc - (buflim - buffer) - sizeof (uword));
+
+  return cc;
+}
+
+/* Flags controlling the style of output. */
+static enum
+{
+  BINARY_BINARY_FILES,
+  TEXT_BINARY_FILES,
+  WITHOUT_MATCH_BINARY_FILES
+} binary_files;		/* How to handle binary files.  */
+
+/* Options for output as a list of matching/non-matching files */
+static enum
+{
+  LISTFILES_NONE,
+  LISTFILES_MATCHING,
+  LISTFILES_NONMATCHING,
+} list_files;
+
+static int filename_mask;	/* If zero, output nulls after filenames.  */
+static bool out_quiet;		/* Suppress all normal output. */
+static bool out_invert;		/* Print nonmatching stuff. */
+static int out_file;		/* Print filenames. */
+static bool out_line;		/* Print line numbers. */
+static bool out_byte;		/* Print byte offsets. */
+static intmax_t out_before;	/* Lines of leading context. */
+static intmax_t out_after;	/* Lines of trailing context. */
+static bool count_matches;	/* Count matching lines.  */
+static bool no_filenames;	/* Suppress file names.  */
+static intmax_t max_count;	/* Stop after outputting this many
+                                   lines from an input file.  */
+static bool line_buffered;	/* Use line buffering.  */
+static char *label = NULL;      /* Fake filename for stdin */
+
+
+/* Internal variables to keep track of byte count, context, etc. */
+static uintmax_t totalcc;	/* Total character count before bufbeg. */
+static char const *lastnl;	/* Pointer after last newline counted. */
+static char *lastout;		/* Pointer after last character output;
+                                   NULL if no character has been output
+                                   or if it's conceptually before bufbeg. */
+static intmax_t outleft;	/* Maximum number of lines to be output.  */
+static intmax_t pending;	/* Pending lines of output.
+                                   Always kept 0 if out_quiet is true.  */
+static bool done_on_match;	/* Stop scanning file on first match.  */
+static bool exit_on_match;	/* Exit on first match.  */
+
+#include "dosbuf.c"
+
+static void
+nlscan (char const *lim)
+{
+  size_t newlines = 0;
+  char const *beg;
+  for (beg = lastnl; beg < lim; beg++)
+    {
+      beg = memchr (beg, eolbyte, lim - beg);
+      if (!beg)
+        break;
+      newlines++;
+    }
+  totalnl = add_count (totalnl, newlines);
+  lastnl = lim;
+}
+
+/* Print the current filename.  */
+static void
+print_filename (void)
+{
+  pr_sgr_start_if (filename_color);
+  fputs_errno (filename);
+  pr_sgr_end_if (filename_color);
+}
+
+/* Print a character separator.  */
+static void
+print_sep (char sep)
+{
+  pr_sgr_start_if (sep_color);
+  putchar_errno (sep);
+  pr_sgr_end_if (sep_color);
+}
+
+/* Print a line number or a byte offset.  */
+static void
+print_offset (uintmax_t pos, int min_width, const char *color)
+{
+  /* Do not rely on printf to print pos, since uintmax_t may be longer
+     than long, and long long is not portable.  */
+
+  char buf[sizeof pos * CHAR_BIT];
+  char *p = buf + sizeof buf;
+
+  do
+    {
+      *--p = '0' + pos % 10;
+      --min_width;
+    }
+  while ((pos /= 10) != 0);
+
+  /* Do this to maximize the probability of alignment across lines.  */
+  if (align_tabs)
+    while (--min_width >= 0)
+      *--p = ' ';
+
+  pr_sgr_start_if (color);
+  fwrite_errno (p, 1, buf + sizeof buf - p);
+  pr_sgr_end_if (color);
+}
+
+/* Print a whole line head (filename, line, byte).  The output data
+   starts at BEG and contains LEN bytes; it is followed by at least
+   sizeof (uword) bytes, the first of which may be temporarily modified.
+   The output data comes from what is perhaps a larger input line that
+   goes until LIM, where LIM[-1] is an end-of-line byte.  Use SEP as
+   the separator on output.
+
+   Return true unless the line was suppressed due to an encoding error.  */
+
+static bool
+print_line_head (char *beg, size_t len, char const *lim, char sep)
+{
+  if (binary_files != TEXT_BINARY_FILES)
+    {
+      char ch = beg[len];
+      bool encoding_errors = buf_has_encoding_errors (beg, len);
+      beg[len] = ch;
+      if (encoding_errors)
+        {
+          encoding_error_output = true;
+          return false;
+        }
+    }
+
+  bool pending_sep = false;
+
+  if (out_file)
+    {
+      print_filename ();
+      if (filename_mask)
+        pending_sep = true;
+      else
+        putchar_errno (0);
+    }
+
+  if (out_line)
+    {
+      if (lastnl < lim)
+        {
+          nlscan (beg);
+          totalnl = add_count (totalnl, 1);
+          lastnl = lim;
+        }
+      if (pending_sep)
+        print_sep (sep);
+      print_offset (totalnl, 4, line_num_color);
+      pending_sep = true;
+    }
+
+  if (out_byte)
+    {
+      uintmax_t pos = add_count (totalcc, beg - bufbeg);
+      pos = dossified_pos (pos);
+      if (pending_sep)
+        print_sep (sep);
+      print_offset (pos, 6, byte_num_color);
+      pending_sep = true;
+    }
+
+  if (pending_sep)
+    {
+      /* This assumes sep is one column wide.
+         Try doing this any other way with Unicode
+         (and its combining and wide characters)
+         filenames and you're wasting your efforts.  */
+      if (align_tabs)
+        fputs_errno ("\t\b");
+
+      print_sep (sep);
+    }
+
+  return true;
+}
+
+static char *
+print_line_middle (char *beg, char *lim,
+                   const char *line_color, const char *match_color)
+{
+  size_t match_size;
+  size_t match_offset;
+  char *cur;
+  char *mid = NULL;
+  char *b;
+
+  for (cur = beg;
+       (cur < lim
+        && ((match_offset = execute (beg, lim - beg, &match_size, cur))
+            != (size_t) -1));
+       cur = b + match_size)
+    {
+      b = beg + match_offset;
+
+      /* Avoid matching the empty line at the end of the buffer. */
+      if (b == lim)
+        break;
+
+      /* Avoid hanging on grep --color "" foo */
+      if (match_size == 0)
+        {
+          /* Make minimal progress; there may be further non-empty matches.  */
+          /* XXX - Could really advance by one whole multi-octet character.  */
+          match_size = 1;
+          if (!mid)
+            mid = cur;
+        }
+      else
+        {
+          /* This function is called on a matching line only,
+             but is it selected or rejected/context?  */
+          if (only_matching)
+            {
+              char sep = out_invert ? SEP_CHAR_REJECTED : SEP_CHAR_SELECTED;
+              if (! print_line_head (b, match_size, lim, sep))
+                return NULL;
+            }
+          else
+            {
+              pr_sgr_start (line_color);
+              if (mid)
+                {
+                  cur = mid;
+                  mid = NULL;
+                }
+              fwrite_errno (cur, 1, b - cur);
+            }
+
+          pr_sgr_start_if (match_color);
+          fwrite_errno (b, 1, match_size);
+          pr_sgr_end_if (match_color);
+          if (only_matching)
+            putchar_errno (eolbyte);
+        }
+    }
+
+  if (only_matching)
+    cur = lim;
+  else if (mid)
+    cur = mid;
+
+  return cur;
+}
+
+static char *
+print_line_tail (char *beg, const char *lim, const char *line_color)
+{
+  size_t eol_size;
+  size_t tail_size;
+
+  eol_size   = (lim > beg && lim[-1] == eolbyte);
+  eol_size  += (lim - eol_size > beg && lim[-(1 + eol_size)] == '\r');
+  tail_size  =  lim - eol_size - beg;
+
+  if (tail_size > 0)
+    {
+      pr_sgr_start (line_color);
+      fwrite_errno (beg, 1, tail_size);
+      beg += tail_size;
+      pr_sgr_end (line_color);
+    }
+
+  return beg;
+}
+
+static void
+prline (char *beg, char *lim, char sep)
+{
+  bool matching;
+  const char *line_color;
+  const char *match_color;
+
+  if (!only_matching)
+    if (! print_line_head (beg, lim - beg - 1, lim, sep))
+      return;
+
+  matching = (sep == SEP_CHAR_SELECTED) ^ out_invert;
+
+  if (color_option)
+    {
+      line_color = (((sep == SEP_CHAR_SELECTED)
+                     ^ (out_invert && (color_option < 0)))
+                    ? selected_line_color  : context_line_color);
+      match_color = (sep == SEP_CHAR_SELECTED
+                     ? selected_match_color : context_match_color);
+    }
+  else
+    line_color = match_color = NULL; /* Shouldn't be used.  */
+
+  if ((only_matching && matching)
+      || (color_option && (*line_color || *match_color)))
+    {
+      /* We already know that non-matching lines have no match (to colorize). */
+      if (matching && (only_matching || *match_color))
+        {
+          beg = print_line_middle (beg, lim, line_color, match_color);
+          if (! beg)
+            return;
+        }
+
+      if (!only_matching && *line_color)
+        {
+          /* This code is exercised at least when grep is invoked like this:
+             echo k| GREP_COLORS='sl=01;32' src/grep k --color=always  */
+          beg = print_line_tail (beg, lim, line_color);
+        }
+    }
+
+  if (!only_matching && lim > beg)
+    fwrite_errno (beg, 1, lim - beg);
+
+  if (line_buffered)
+    fflush_errno ();
+
+  if (stdout_errno)
+    error (EXIT_TROUBLE, stdout_errno, _("write error"));
+
+  lastout = lim;
+}
+
+/* Print pending lines of trailing context prior to LIM. Trailing context ends
+   at the next matching line when OUTLEFT is 0.  */
+static void
+prpending (char const *lim)
+{
+  if (!lastout)
+    lastout = bufbeg;
+  while (pending > 0 && lastout < lim)
+    {
+      char *nl = memchr (lastout, eolbyte, lim - lastout);
+      size_t match_size;
+      --pending;
+      if (outleft
+          || ((execute (lastout, nl + 1 - lastout,
+                        &match_size, NULL) == (size_t) -1)
+              == !out_invert))
+        prline (lastout, nl + 1, SEP_CHAR_REJECTED);
+      else
+        pending = 0;
+    }
+}
+
+/* Output the lines between BEG and LIM.  Deal with context.  */
+static void
+prtext (char *beg, char *lim)
+{
+  static bool used;	/* Avoid printing SEP_STR_GROUP before any output.  */
+  char eol = eolbyte;
+
+  if (!out_quiet && pending > 0)
+    prpending (beg);
+
+  char *p = beg;
+
+  if (!out_quiet)
+    {
+      /* Deal with leading context.  */
+      char const *bp = lastout ? lastout : bufbeg;
+      intmax_t i;
+      for (i = 0; i < out_before; ++i)
+        if (p > bp)
+          do
+            --p;
+          while (p[-1] != eol);
+
+      /* Print the group separator unless the output is adjacent to
+         the previous output in the file.  */
+      if ((0 <= out_before || 0 <= out_after) && used
+          && p != lastout && group_separator)
+        {
+          pr_sgr_start_if (sep_color);
+          fputs_errno (group_separator);
+          pr_sgr_end_if (sep_color);
+          putchar_errno ('\n');
+        }
+
+      while (p < beg)
+        {
+          char *nl = memchr (p, eol, beg - p);
+          nl++;
+          prline (p, nl, SEP_CHAR_REJECTED);
+          p = nl;
+        }
+    }
+
+  intmax_t n;
+  if (out_invert)
+    {
+      /* One or more lines are output.  */
+      for (n = 0; p < lim && n < outleft; n++)
+        {
+          char *nl = memchr (p, eol, lim - p);
+          nl++;
+          if (!out_quiet)
+            prline (p, nl, SEP_CHAR_SELECTED);
+          p = nl;
+        }
+    }
+  else
+    {
+      /* Just one line is output.  */
+      if (!out_quiet)
+        prline (beg, lim, SEP_CHAR_SELECTED);
+      n = 1;
+      p = lim;
+    }
+
+  after_last_match = bufoffset - (buflim - p);
+  pending = out_quiet ? 0 : MAX (0, out_after);
+  used = true;
+  outleft -= n;
+}
+
+/* Replace all NUL bytes in buffer P (which ends at LIM) with EOL.
+   This avoids running out of memory when binary input contains a long
+   sequence of zeros, which would otherwise be considered to be part
+   of a long line.  P[LIM] should be EOL.  */
+static void
+zap_nuls (char *p, char *lim, char eol)
+{
+  if (eol)
+    while (true)
+      {
+        *lim = '\0';
+        p += strlen (p);
+        *lim = eol;
+        if (p == lim)
+          break;
+        do
+          *p++ = eol;
+        while (!*p);
+      }
+}
+
+/* Scan the specified portion of the buffer, matching lines (or
+   between matching lines if OUT_INVERT is true).  Return a count of
+   lines printed.  Replace all NUL bytes with NUL_ZAPPER as we go.  */
+static intmax_t
+grepbuf (char *beg, char const *lim)
+{
+  intmax_t outleft0 = outleft;
+  char *endp;
+
+  for (char *p = beg; p < lim; p = endp)
+    {
+      size_t match_size;
+      size_t match_offset = execute (p, lim - p, &match_size, NULL);
+      if (match_offset == (size_t) -1)
+        {
+          if (!out_invert)
+            break;
+          match_offset = lim - p;
+          match_size = 0;
+        }
+      char *b = p + match_offset;
+      endp = b + match_size;
+      /* Avoid matching the empty line at the end of the buffer. */
+      if (!out_invert && b == lim)
+        break;
+      if (!out_invert || p < b)
+        {
+          char *prbeg = out_invert ? p : b;
+          char *prend = out_invert ? b : endp;
+          prtext (prbeg, prend);
+          if (!outleft || done_on_match)
+            {
+              if (exit_on_match)
+                exit (errseen ? exit_failure : EXIT_SUCCESS);
+              break;
+            }
+        }
+    }
+
+  return outleft0 - outleft;
+}
+
+/* Search a given (non-directory) file.  Return a count of lines printed. */
+static intmax_t
+grep (int fd, struct stat const *st)
+{
+  intmax_t nlines, i;
+  size_t residue, save;
+  char oldc;
+  char *beg;
+  char *lim;
+  char eol = eolbyte;
+  char nul_zapper = '\0';
+  bool done_on_match_0 = done_on_match;
+  bool out_quiet_0 = out_quiet;
+
+  /* The value of NLINES when nulls were first deduced in the input;
+     this is not necessarily the same as the number of matching lines
+     before the first null.  -1 if no input nulls have been deduced.  */
+  intmax_t nlines_first_null = -1;
+
+  if (! reset (fd, st))
+    return 0;
+
+  totalcc = 0;
+  lastout = 0;
+  totalnl = 0;
+  outleft = max_count;
+  after_last_match = 0;
+  pending = 0;
+  skip_nuls = skip_empty_lines && !eol;
+  encoding_error_output = false;
+  seek_data_failed = false;
+
+  nlines = 0;
+  residue = 0;
+  save = 0;
+
+  if (! fillbuf (save, st))
+    {
+      suppressible_error (filename, errno);
+      return 0;
+    }
+
+  for (bool firsttime = true; ; firsttime = false)
+    {
+      if (nlines_first_null < 0 && eol && binary_files != TEXT_BINARY_FILES
+          && (buf_has_nulls (bufbeg, buflim - bufbeg)
+              || (firsttime && file_must_have_nulls (buflim - bufbeg, fd, st))))
+        {
+          if (binary_files == WITHOUT_MATCH_BINARY_FILES)
+            return 0;
+          if (!count_matches)
+            done_on_match = out_quiet = true;
+          nlines_first_null = nlines;
+          nul_zapper = eol;
+          skip_nuls = skip_empty_lines;
+        }
+
+      lastnl = bufbeg;
+      if (lastout)
+        lastout = bufbeg;
+
+      beg = bufbeg + save;
+
+      /* no more data to scan (eof) except for maybe a residue -> break */
+      if (beg == buflim)
+        break;
+
+      zap_nuls (beg, buflim, nul_zapper);
+
+      /* Determine new residue (the length of an incomplete line at the end of
+         the buffer, 0 means there is no incomplete last line).  */
+      oldc = beg[-1];
+      beg[-1] = eol;
+      /* FIXME: use rawmemrchr if/when it exists, since we have ensured
+         that this use of memrchr is guaranteed never to return NULL.  */
+      lim = memrchr (beg - 1, eol, buflim - beg + 1);
+      ++lim;
+      beg[-1] = oldc;
+      if (lim == beg)
+        lim = beg - residue;
+      beg -= residue;
+      residue = buflim - lim;
+
+      if (beg < lim)
+        {
+          if (outleft)
+            nlines += grepbuf (beg, lim);
+          if (pending)
+            prpending (lim);
+          if ((!outleft && !pending)
+              || (done_on_match && MAX (0, nlines_first_null) < nlines))
+            goto finish_grep;
+        }
+
+      /* The last OUT_BEFORE lines at the end of the buffer will be needed as
+         leading context if there is a matching line at the begin of the
+         next data. Make beg point to their begin.  */
+      i = 0;
+      beg = lim;
+      while (i < out_before && beg > bufbeg && beg != lastout)
+        {
+          ++i;
+          do
+            --beg;
+          while (beg[-1] != eol);
+        }
+
+      /* Detect whether leading context is adjacent to previous output.  */
+      if (beg != lastout)
+        lastout = 0;
+
+      /* Handle some details and read more data to scan.  */
+      save = residue + lim - beg;
+      if (out_byte)
+        totalcc = add_count (totalcc, buflim - bufbeg - save);
+      if (out_line)
+        nlscan (beg);
+      if (! fillbuf (save, st))
+        {
+          suppressible_error (filename, errno);
+          goto finish_grep;
+        }
+    }
+  if (residue)
+    {
+      *buflim++ = eol;
+      if (outleft)
+        nlines += grepbuf (bufbeg + save - residue, buflim);
+      if (pending)
+        prpending (buflim);
+    }
+
+ finish_grep:
+  done_on_match = done_on_match_0;
+  out_quiet = out_quiet_0;
+  if (!out_quiet && (encoding_error_output
+                     || (0 <= nlines_first_null && nlines_first_null < nlines)))
+    {
+      printf_errno (_("Binary file %s matches\n"), filename);
+      if (line_buffered)
+        fflush_errno ();
+    }
+  return nlines;
+}
+
+static bool
+grepdirent (FTS *fts, FTSENT *ent, bool command_line)
+{
+  bool follow;
+  command_line &= ent->fts_level == FTS_ROOTLEVEL;
+
+  if (ent->fts_info == FTS_DP)
+    {
+      if (directories == RECURSE_DIRECTORIES && command_line)
+        out_file &= ~ (2 * !no_filenames);
+      return true;
+    }
+
+  if (!command_line
+      && skipped_file (ent->fts_name, false,
+                       (ent->fts_info == FTS_D || ent->fts_info == FTS_DC
+                        || ent->fts_info == FTS_DNR)))
+    {
+      fts_set (fts, ent, FTS_SKIP);
+      return true;
+    }
+
+  filename = ent->fts_path;
+  if (omit_dot_slash && filename[1])
+    filename += 2;
+  follow = (fts->fts_options & FTS_LOGICAL
+            || (fts->fts_options & FTS_COMFOLLOW && command_line));
+
+  switch (ent->fts_info)
+    {
+    case FTS_D:
+      if (directories == RECURSE_DIRECTORIES)
+        {
+          out_file |= 2 * !no_filenames;
+          return true;
+        }
+      fts_set (fts, ent, FTS_SKIP);
+      break;
+
+    case FTS_DC:
+      if (!suppress_errors)
+        error (0, 0, _("warning: %s: %s"), filename,
+               _("recursive directory loop"));
+      return true;
+
+    case FTS_DNR:
+    case FTS_ERR:
+    case FTS_NS:
+      suppressible_error (filename, ent->fts_errno);
+      return true;
+
+    case FTS_DEFAULT:
+    case FTS_NSOK:
+      if (skip_devices (command_line))
+        {
+          struct stat *st = ent->fts_statp;
+          struct stat st1;
+          if (! st->st_mode)
+            {
+              /* The file type is not already known.  Get the file status
+                 before opening, since opening might have side effects
+                 on a device.  */
+              int flag = follow ? 0 : AT_SYMLINK_NOFOLLOW;
+              if (fstatat (fts->fts_cwd_fd, ent->fts_accpath, &st1, flag) != 0)
+                {
+                  suppressible_error (filename, errno);
+                  return true;
+                }
+              st = &st1;
+            }
+          if (is_device_mode (st->st_mode))
+            return true;
+        }
+      break;
+
+    case FTS_F:
+    case FTS_SLNONE:
+      break;
+
+    case FTS_SL:
+    case FTS_W:
+      return true;
+
+    default:
+      abort ();
+    }
+
+  return grepfile (fts->fts_cwd_fd, ent->fts_accpath, follow, command_line);
+}
+
+/* True if errno is ERR after 'open ("symlink", ... O_NOFOLLOW ...)'.
+   POSIX specifies ELOOP, but it's EMLINK on FreeBSD and EFTYPE on NetBSD.  */
+static bool
+open_symlink_nofollow_error (int err)
+{
+  if (err == ELOOP || err == EMLINK)
+    return true;
+#ifdef EFTYPE
+  if (err == EFTYPE)
+    return true;
+#endif
+  return false;
+}
+
+static bool
+grepfile (int dirdesc, char const *name, bool follow, bool command_line)
+{
+  int oflag = (O_RDONLY | O_NOCTTY
+               | (follow ? 0 : O_NOFOLLOW)
+               | (skip_devices (command_line) ? O_NONBLOCK : 0));
+  int desc = openat_safer (dirdesc, name, oflag);
+  if (desc < 0)
+    {
+      if (follow || ! open_symlink_nofollow_error (errno))
+        suppressible_error (filename, errno);
+      return true;
+    }
+  return grepdesc (desc, command_line);
+}
+
+static bool
+grepdesc (int desc, bool command_line)
+{
+  intmax_t count;
+  bool status = true;
+  struct stat st;
+
+  /* Get the file status, possibly for the second time.  This catches
+     a race condition if the directory entry changes after the
+     directory entry is read and before the file is opened.  For
+     example, normally DESC is a directory only at the top level, but
+     there is an exception if some other process substitutes a
+     directory for a non-directory while 'grep' is running.  */
+  if (fstat (desc, &st) != 0)
+    {
+      suppressible_error (filename, errno);
+      goto closeout;
+    }
+
+  if (desc != STDIN_FILENO && skip_devices (command_line)
+      && is_device_mode (st.st_mode))
+    goto closeout;
+
+  if (desc != STDIN_FILENO && command_line
+      && skipped_file (filename, true, S_ISDIR (st.st_mode) != 0))
+    goto closeout;
+
+  if (desc != STDIN_FILENO
+      && directories == RECURSE_DIRECTORIES && S_ISDIR (st.st_mode))
+    {
+      /* Traverse the directory starting with its full name, because
+         unfortunately fts provides no way to traverse the directory
+         starting from its file descriptor.  */
+
+      FTS *fts;
+      FTSENT *ent;
+      int opts = fts_options & ~(command_line ? 0 : FTS_COMFOLLOW);
+      char *fts_arg[2];
+
+      /* Close DESC now, to conserve file descriptors if the race
+         condition occurs many times in a deep recursion.  */
+      if (close (desc) != 0)
+        suppressible_error (filename, errno);
+
+      fts_arg[0] = (char *) filename;
+      fts_arg[1] = NULL;
+      fts = fts_open (fts_arg, opts, NULL);
+
+      if (!fts)
+        xalloc_die ();
+      while ((ent = fts_read (fts)))
+        status &= grepdirent (fts, ent, command_line);
+      if (errno)
+        suppressible_error (filename, errno);
+      if (fts_close (fts) != 0)
+        suppressible_error (filename, errno);
+      return status;
+    }
+  if (desc != STDIN_FILENO
+      && ((directories == SKIP_DIRECTORIES && S_ISDIR (st.st_mode))
+          || ((devices == SKIP_DEVICES
+               || (devices == READ_COMMAND_LINE_DEVICES && !command_line))
+              && is_device_mode (st.st_mode))))
+    goto closeout;
+
+  /* If there is a regular file on stdout and the current file refers
+     to the same i-node, we have to report the problem and skip it.
+     Otherwise when matching lines from some other input reach the
+     disk before we open this file, we can end up reading and matching
+     those lines and appending them to the file from which we're reading.
+     Then we'd have what appears to be an infinite loop that'd terminate
+     only upon filling the output file system or reaching a quota.
+     However, there is no risk of an infinite loop if grep is generating
+     no output, i.e., with --silent, --quiet, -q.
+     Similarly, with any of these:
+       --max-count=N (-m) (for N >= 2)
+       --files-with-matches (-l)
+       --files-without-match (-L)
+     there is no risk of trouble.
+     For --max-count=1, grep stops after printing the first match,
+     so there is no risk of malfunction.  But even --max-count=2, with
+     input==output, while there is no risk of infloop, there is a race
+     condition that could result in "alternate" output.  */
+  if (!out_quiet && list_files == LISTFILES_NONE && 1 < max_count
+      && S_ISREG (st.st_mode) && SAME_INODE (st, out_stat))
+    {
+      if (! suppress_errors)
+        error (0, 0, _("input file %s is also the output"), quote (filename));
+      errseen = true;
+      goto closeout;
+    }
+
+#if defined SET_BINARY
+  /* Set input to binary mode.  Pipes are simulated with files
+     on DOS, so this includes the case of "foo | grep bar".  */
+  if (!isatty (desc))
+    SET_BINARY (desc);
+#endif
+
+  count = grep (desc, &st);
+  if (count_matches)
+    {
+      if (out_file)
+        {
+          print_filename ();
+          if (filename_mask)
+            print_sep (SEP_CHAR_SELECTED);
+          else
+            putchar_errno (0);
+        }
+      printf_errno ("%" PRIdMAX "\n", count);
+      if (line_buffered)
+        fflush_errno ();
+    }
+
+  status = !count;
+  if (list_files == (status ? LISTFILES_NONMATCHING : LISTFILES_MATCHING))
+    {
+      print_filename ();
+      putchar_errno ('\n' & filename_mask);
+      if (line_buffered)
+        fflush_errno ();
+    }
+
+  if (desc == STDIN_FILENO)
+    {
+      off_t required_offset = outleft ? bufoffset : after_last_match;
+      if (required_offset != bufoffset
+          && lseek (desc, required_offset, SEEK_SET) < 0
+          && S_ISREG (st.st_mode))
+        suppressible_error (filename, errno);
+    }
+
+ closeout:
+  if (desc != STDIN_FILENO && close (desc) != 0)
+    suppressible_error (filename, errno);
+  return status;
+}
+
+static bool
+grep_command_line_arg (char const *arg)
+{
+  if (STREQ (arg, "-"))
+    {
+      filename = label ? label : _("(standard input)");
+      return grepdesc (STDIN_FILENO, true);
+    }
+  else
+    {
+      filename = arg;
+      return grepfile (AT_FDCWD, arg, true, true);
+    }
+}
+
+_Noreturn void usage (int);
+void
+usage (int status)
+{
+  if (status != 0)
+    {
+      fprintf (stderr, _("Usage: %s [OPTION]... PATTERN [FILE]...\n"),
+               getprogname());
+      fprintf (stderr, _("Try '%s --help' for more information.\n"),
+               getprogname());
+    }
+  else
+    {
+      printf (_("Usage: %s [OPTION]... PATTERN [FILE]...\n"), getprogname());
+      printf (_("Search for PATTERN in each FILE or standard input.\n"));
+      printf (_("PATTERN is, by default, a basic regular expression (BRE).\n"));
+      printf (_("\
+Example: %s -i 'hello world' menu.h main.c\n\
+\n\
+Regexp selection and interpretation:\n"), getprogname());
+      printf (_("\
+  -E, --extended-regexp     PATTERN is an extended regular expression (ERE)\n\
+  -F, --fixed-strings       PATTERN is a set of newline-separated strings\n\
+  -G, --basic-regexp        PATTERN is a basic regular expression (BRE)\n\
+  -P, --perl-regexp         PATTERN is a Perl regular expression\n"));
+  /* -X is deliberately undocumented.  */
+      printf (_("\
+  -e, --regexp=PATTERN      use PATTERN for matching\n\
+  -f, --file=FILE           obtain PATTERN from FILE\n\
+  -i, --ignore-case         ignore case distinctions\n\
+  -w, --word-regexp         force PATTERN to match only whole words\n\
+  -x, --line-regexp         force PATTERN to match only whole lines\n\
+  -z, --null-data           a data line ends in 0 byte, not newline\n"));
+      printf (_("\
+\n\
+Miscellaneous:\n\
+  -s, --no-messages         suppress error messages\n\
+  -v, --invert-match        select non-matching lines\n\
+  -V, --version             display version information and exit\n\
+      --help                display this help text and exit\n"));
+      printf (_("\
+\n\
+Output control:\n\
+  -m, --max-count=NUM       stop after NUM matches\n\
+  -b, --byte-offset         print the byte offset with output lines\n\
+  -n, --line-number         print line number with output lines\n\
+      --line-buffered       flush output on every line\n\
+  -H, --with-filename       print the file name for each match\n\
+  -h, --no-filename         suppress the file name prefix on output\n\
+      --label=LABEL         use LABEL as the standard input file name prefix\n\
+"));
+      printf (_("\
+  -o, --only-matching       show only the part of a line matching PATTERN\n\
+  -q, --quiet, --silent     suppress all normal output\n\
+      --binary-files=TYPE   assume that binary files are TYPE;\n\
+                            TYPE is 'binary', 'text', or 'without-match'\n\
+  -a, --text                equivalent to --binary-files=text\n\
+"));
+      printf (_("\
+  -I                        equivalent to --binary-files=without-match\n\
+  -d, --directories=ACTION  how to handle directories;\n\
+                            ACTION is 'read', 'recurse', or 'skip'\n\
+  -D, --devices=ACTION      how to handle devices, FIFOs and sockets;\n\
+                            ACTION is 'read' or 'skip'\n\
+  -r, --recursive           like --directories=recurse\n\
+  -R, --dereference-recursive  likewise, but follow all symlinks\n\
+"));
+      printf (_("\
+      --include=FILE_PATTERN  search only files that match FILE_PATTERN\n\
+      --exclude=FILE_PATTERN  skip files and directories matching\
+ FILE_PATTERN\n\
+      --exclude-from=FILE   skip files matching any file pattern from FILE\n\
+      --exclude-dir=PATTERN  directories that match PATTERN will be skipped.\n\
+"));
+      printf (_("\
+  -L, --files-without-match  print only names of FILEs containing no match\n\
+  -l, --files-with-matches  print only names of FILEs containing matches\n\
+  -c, --count               print only a count of matching lines per FILE\n\
+  -T, --initial-tab         make tabs line up (if needed)\n\
+  -Z, --null                print 0 byte after FILE name\n"));
+      printf (_("\
+\n\
+Context control:\n\
+  -B, --before-context=NUM  print NUM lines of leading context\n\
+  -A, --after-context=NUM   print NUM lines of trailing context\n\
+  -C, --context=NUM         print NUM lines of output context\n\
+"));
+      printf (_("\
+  -NUM                      same as --context=NUM\n\
+      --color[=WHEN],\n\
+      --colour[=WHEN]       use markers to highlight the matching strings;\n\
+                            WHEN is 'always', 'never', or 'auto'\n\
+  -U, --binary              do not strip CR characters at EOL (MSDOS/Windows)\n\
+  -u, --unix-byte-offsets   report offsets as if CRs were not there\n\
+                            (MSDOS/Windows)\n\
+\n"));
+      printf (_("\
+'egrep' means 'grep -E'.  'fgrep' means 'grep -F'.\n\
+Direct invocation as either 'egrep' or 'fgrep' is deprecated.\n"));
+      printf (_("\
+When FILE is -, read standard input.  With no FILE, read . if a command-line\n\
+-r is given, - otherwise.  If fewer than two FILEs are given, assume -h.\n\
+Exit status is 0 if any line is selected, 1 otherwise;\n\
+if any error occurs and -q is not given, the exit status is 2.\n"));
+      emit_bug_reporting_address ();
+    }
+  exit (status);
+}
+
+/* Pattern compilers and matchers.  */
+
+static void
+Gcompile (char const *pattern, size_t size)
+{
+  GEAcompile (pattern, size, RE_SYNTAX_GREP);
+}
+
+static void
+Ecompile (char const *pattern, size_t size)
+{
+  GEAcompile (pattern, size, RE_SYNTAX_EGREP);
+}
+
+static void
+Acompile (char const *pattern, size_t size)
+{
+  GEAcompile (pattern, size, RE_SYNTAX_AWK);
+}
+
+static void
+GAcompile (char const *pattern, size_t size)
+{
+  GEAcompile (pattern, size, RE_SYNTAX_GNU_AWK);
+}
+
+static void
+PAcompile (char const *pattern, size_t size)
+{
+  GEAcompile (pattern, size, RE_SYNTAX_POSIX_AWK);
+}
+
+struct matcher
+{
+  char const name[16];
+  compile_fp_t compile;
+  execute_fp_t execute;
+};
+static struct matcher const matchers[] = {
+  { "grep",      Gcompile, EGexecute },
+  { "egrep",     Ecompile, EGexecute },
+  { "fgrep",     Fcompile,  Fexecute },
+  { "awk",       Acompile, EGexecute },
+  { "gawk",     GAcompile, EGexecute },
+  { "posixawk", PAcompile, EGexecute },
+  { "perl",      Pcompile,  Pexecute },
+  { "", NULL, NULL },
+};
+
+/* Set the matcher to M if available.  Exit in case of conflicts or if
+   M is not available.  */
+static void
+setmatcher (char const *m)
+{
+  struct matcher const *p;
+
+  if (matcher && !STREQ (matcher, m))
+    error (EXIT_TROUBLE, 0, _("conflicting matchers specified"));
+
+  for (p = matchers; p->compile; p++)
+    if (STREQ (m, p->name))
+      {
+        matcher = p->name;
+        compile = p->compile;
+        execute = p->execute;
+        return;
+      }
+
+  error (EXIT_TROUBLE, 0, _("invalid matcher %s"), m);
+}
+
+/* Find the white-space-separated options specified by OPTIONS, and
+   using BUF to store copies of these options, set ARGV[0], ARGV[1],
+   etc. to the option copies.  Return the number N of options found.
+   Do not set ARGV[N] to NULL.  If ARGV is NULL, do not store ARGV[0]
+   etc.  Backslash can be used to escape whitespace (and backslashes).  */
+static size_t
+prepend_args (char const *options, char *buf, char **argv)
+{
+  char const *o = options;
+  char *b = buf;
+  size_t n = 0;
+
+  for (;;)
+    {
+      while (c_isspace (to_uchar (*o)))
+        o++;
+      if (!*o)
+        return n;
+      if (argv)
+        argv[n] = b;
+      n++;
+
+      do
+        if ((*b++ = *o++) == '\\' && *o)
+          b[-1] = *o++;
+      while (*o && ! c_isspace (to_uchar (*o)));
+
+      *b++ = '\0';
+    }
+}
+
+/* Prepend the whitespace-separated options in OPTIONS to the argument
+   vector of a main program with argument count *PARGC and argument
+   vector *PARGV.  Return the number of options prepended.  */
+static int
+prepend_default_options (char const *options, int *pargc, char ***pargv)
+{
+  if (options && *options)
+    {
+      char *buf = xmalloc (strlen (options) + 1);
+      size_t prepended = prepend_args (options, buf, NULL);
+      int argc = *pargc;
+      char *const *argv = *pargv;
+      char **pp;
+      enum { MAX_ARGS = MIN (INT_MAX, SIZE_MAX / sizeof *pp - 1) };
+      if (MAX_ARGS - argc < prepended)
+        xalloc_die ();
+      pp = xmalloc ((prepended + argc + 1) * sizeof *pp);
+      *pargc = prepended + argc;
+      *pargv = pp;
+      *pp++ = *argv++;
+      pp += prepend_args (options, buf, pp);
+      while ((*pp++ = *argv++))
+        continue;
+      return prepended;
+    }
+
+  return 0;
+}
+
+/* Get the next non-digit option from ARGC and ARGV.
+   Return -1 if there are no more options.
+   Process any digit options that were encountered on the way,
+   and store the resulting integer into *DEFAULT_CONTEXT.  */
+static int
+get_nondigit_option (int argc, char *const *argv, intmax_t *default_context)
+{
+  static int prev_digit_optind = -1;
+  int this_digit_optind;
+  bool was_digit;
+  char buf[INT_BUFSIZE_BOUND (intmax_t) + 4];
+  char *p = buf;
+  int opt;
+
+  was_digit = false;
+  this_digit_optind = optind;
+  while (true)
+    {
+      opt = getopt_long (argc, (char **) argv, short_options,
+                         long_options, NULL);
+      if (! c_isdigit (opt))
+        break;
+
+      if (prev_digit_optind != this_digit_optind || !was_digit)
+        {
+          /* Reset to start another context length argument.  */
+          p = buf;
+        }
+      else
+        {
+          /* Suppress trivial leading zeros, to avoid incorrect
+             diagnostic on strings like 00000000000.  */
+          p -= buf[0] == '0';
+        }
+
+      if (p == buf + sizeof buf - 4)
+        {
+          /* Too many digits.  Append "..." to make context_length_arg
+             complain about "X...", where X contains the digits seen
+             so far.  */
+          strcpy (p, "...");
+          p += 3;
+          break;
+        }
+      *p++ = opt;
+
+      was_digit = true;
+      prev_digit_optind = this_digit_optind;
+      this_digit_optind = optind;
+    }
+  if (p != buf)
+    {
+      *p = '\0';
+      context_length_arg (buf, default_context);
+    }
+
+  return opt;
+}
+
+/* Parse GREP_COLORS.  The default would look like:
+     GREP_COLORS='ms=01;31:mc=01;31:sl=:cx=:fn=35:ln=32:bn=32:se=36'
+   with boolean capabilities (ne and rv) unset (i.e., omitted).
+   No character escaping is needed or supported.  */
+static void
+parse_grep_colors (void)
+{
+  const char *p;
+  char *q;
+  char *name;
+  char *val;
+
+  p = getenv ("GREP_COLORS"); /* Plural! */
+  if (p == NULL || *p == '\0')
+    return;
+
+  /* Work off a writable copy.  */
+  q = xstrdup (p);
+
+  name = q;
+  val = NULL;
+  /* From now on, be well-formed or you're gone.  */
+  for (;;)
+    if (*q == ':' || *q == '\0')
+      {
+        char c = *q;
+        struct color_cap const *cap;
+
+        *q++ = '\0'; /* Terminate name or val.  */
+        /* Empty name without val (empty cap)
+         * won't match and will be ignored.  */
+        for (cap = color_dict; cap->name; cap++)
+          if (STREQ (cap->name, name))
+            break;
+        /* If name unknown, go on for forward compatibility.  */
+        if (cap->var && val)
+          *(cap->var) = val;
+        if (cap->fct)
+          cap->fct ();
+        if (c == '\0')
+          return;
+        name = q;
+        val = NULL;
+      }
+    else if (*q == '=')
+      {
+        if (q == name || val)
+          return;
+        *q++ = '\0'; /* Terminate name.  */
+        val = q; /* Can be the empty string.  */
+      }
+    else if (val == NULL)
+      q++; /* Accumulate name.  */
+    else if (*q == ';' || c_isdigit (*q))
+      q++; /* Accumulate val.  Protect the terminal from being sent crap.  */
+    else
+      return;
+}
+
+/* Return true if PAT (of length PATLEN) contains an encoding error.  */
+static bool
+contains_encoding_error (char const *pat, size_t patlen)
+{
+  mbstate_t mbs = { 0 };
+  size_t i, charlen;
+
+  for (i = 0; i < patlen; i += charlen)
+    {
+      charlen = mb_clen (pat + i, patlen - i, &mbs);
+      if ((size_t) -2 <= charlen)
+        return true;
+    }
+  return false;
+}
+
+/* Return true if the fgrep pattern PAT, of size PATLEN, matches only
+   single-byte characters including case folding, and so is suitable
+   to be converted to a grep pattern.  */
+
+static bool
+fgrep_icase_available (char const *pat, size_t patlen)
+{
+  bool used[UCHAR_MAX + 1] = { 0, };
+
+  for (size_t i = 0; i < patlen; i++)
+    {
+      unsigned char c = pat[i];
+      if (localeinfo.sbctowc[c] == WEOF)
+        return false;
+      used[c] = true;
+    }
+
+  for (int c = 0; c <= UCHAR_MAX; c++)
+    if (used[c])
+      {
+        wint_t wc = localeinfo.sbctowc[c];
+        wchar_t folded[CASE_FOLDED_BUFSIZE];
+        size_t nfolded = case_folded_counterparts (wc, folded);
+
+        for (size_t i = 0; i < nfolded; i++)
+          {
+            char s[MB_LEN_MAX];
+            mbstate_t mb_state = { 0 };
+            if (1 < wcrtomb (s, folded[i], &mb_state))
+              return false;
+          }
+      }
+
+  return true;
+}
+
+/* Change the pattern *KEYS_P, of size *LEN_P, from fgrep to grep style.  */
+
+static void
+fgrep_to_grep_pattern (char **keys_p, size_t *len_p)
+{
+  size_t len = *len_p;
+  char *keys = *keys_p;
+  mbstate_t mb_state = { 0 };
+  char *new_keys = xnmalloc (len + 1, 2);
+  char *p = new_keys;
+  size_t n;
+
+  for (; len; keys += n, len -= n)
+    {
+      n = mb_clen (keys, len, &mb_state);
+      switch (n)
+        {
+        case (size_t) -2:
+          n = len;
+          /* Fall through.  */
+        default:
+          p = mempcpy (p, keys, n);
+          break;
+
+        case (size_t) -1:
+          memset (&mb_state, 0, sizeof mb_state);
+          n = 1;
+          /* Fall through.  */
+        case 1:
+          switch (*keys)
+            {
+            case '$': case '*': case '.': case '[': case '\\': case '^':
+              *p++ = '\\'; break;
+            }
+          *p++ = *keys;
+          break;
+        }
+    }
+
+  free (*keys_p);
+  *keys_p = new_keys;
+  *len_p = p - new_keys;
+}
+
+int
+main (int argc, char **argv)
+{
+  char *keys;
+  size_t keycc, oldcc, keyalloc;
+  bool with_filenames;
+  size_t cc;
+  int opt, prepended;
+  int prev_optind, last_recursive;
+  int fread_errno;
+  intmax_t default_context;
+  FILE *fp;
+  exit_failure = EXIT_TROUBLE;
+  initialize_main (&argc, &argv);
+
+  keys = NULL;
+  keycc = 0;
+  with_filenames = false;
+  eolbyte = '\n';
+  filename_mask = ~0;
+
+  max_count = INTMAX_MAX;
+
+  /* The value -1 means to use DEFAULT_CONTEXT. */
+  out_after = out_before = -1;
+  /* Default before/after context: changed by -C/-NUM options */
+  default_context = -1;
+  /* Changed by -o option */
+  only_matching = false;
+
+  /* Internationalization. */
+#if defined HAVE_SETLOCALE
+  setlocale (LC_ALL, "");
+#endif
+#if defined ENABLE_NLS
+  bindtextdomain (PACKAGE, LOCALEDIR);
+  textdomain (PACKAGE);
+#endif
+
+  init_localeinfo (&localeinfo);
+
+  atexit (clean_up_stdout);
+
+  last_recursive = 0;
+
+  prepended = prepend_default_options (getenv ("GREP_OPTIONS"), &argc, &argv);
+  if (prepended)
+    error (0, 0, _("warning: GREP_OPTIONS is deprecated;"
+                   " please use an alias or script"));
+
+  compile = matchers[0].compile;
+  execute = matchers[0].execute;
+
+  while (prev_optind = optind,
+         (opt = get_nondigit_option (argc, argv, &default_context)) != -1)
+    switch (opt)
+      {
+      case 'A':
+        context_length_arg (optarg, &out_after);
+        break;
+
+      case 'B':
+        context_length_arg (optarg, &out_before);
+        break;
+
+      case 'C':
+        /* Set output match context, but let any explicit leading or
+           trailing amount specified with -A or -B stand. */
+        context_length_arg (optarg, &default_context);
+        break;
+
+      case 'D':
+        if (STREQ (optarg, "read"))
+          devices = READ_DEVICES;
+        else if (STREQ (optarg, "skip"))
+          devices = SKIP_DEVICES;
+        else
+          error (EXIT_TROUBLE, 0, _("unknown devices method"));
+        break;
+
+      case 'E':
+        setmatcher ("egrep");
+        break;
+
+      case 'F':
+        setmatcher ("fgrep");
+        break;
+
+      case 'P':
+        setmatcher ("perl");
+        break;
+
+      case 'G':
+        setmatcher ("grep");
+        break;
+
+      case 'X': /* undocumented on purpose */
+        setmatcher (optarg);
+        break;
+
+      case 'H':
+        with_filenames = true;
+        no_filenames = false;
+        break;
+
+      case 'I':
+        binary_files = WITHOUT_MATCH_BINARY_FILES;
+        break;
+
+      case 'T':
+        align_tabs = true;
+        break;
+
+      case 'U':
+        dos_binary ();
+        break;
+
+      case 'u':
+        dos_unix_byte_offsets ();
+        break;
+
+      case 'V':
+        show_version = true;
+        break;
+
+      case 'a':
+        binary_files = TEXT_BINARY_FILES;
+        break;
+
+      case 'b':
+        out_byte = true;
+        break;
+
+      case 'c':
+        count_matches = true;
+        break;
+
+      case 'd':
+        directories = XARGMATCH ("--directories", optarg,
+                                 directories_args, directories_types);
+        if (directories == RECURSE_DIRECTORIES)
+          last_recursive = prev_optind;
+        break;
+
+      case 'e':
+        cc = strlen (optarg);
+        keys = xrealloc (keys, keycc + cc + 1);
+        strcpy (&keys[keycc], optarg);
+        keycc += cc;
+        keys[keycc++] = '\n';
+        fl_add (keys, keycc - cc - 1, keycc, "");
+        break;
+
+      case 'f':
+        fp = STREQ (optarg, "-") ? stdin : fopen (optarg, O_TEXT ? "rt" : "r");
+        if (!fp)
+          error (EXIT_TROUBLE, errno, "%s", optarg);
+        for (keyalloc = 1; keyalloc <= keycc + 1; keyalloc *= 2)
+          ;
+        keys = xrealloc (keys, keyalloc);
+        oldcc = keycc;
+        while ((cc = fread (keys + keycc, 1, keyalloc - 1 - keycc, fp)) != 0)
+          {
+            keycc += cc;
+            if (keycc == keyalloc - 1)
+              keys = x2nrealloc (keys, &keyalloc, sizeof *keys);
+          }
+        fread_errno = errno;
+        if (ferror (fp))
+          error (EXIT_TROUBLE, fread_errno, "%s", optarg);
+        if (fp != stdin)
+          fclose (fp);
+        /* Append final newline if file ended in non-newline. */
+        if (oldcc != keycc && keys[keycc - 1] != '\n')
+          keys[keycc++] = '\n';
+        fl_add (keys, oldcc, keycc, xstrdup (optarg));
+        break;
+
+      case 'h':
+        with_filenames = false;
+        no_filenames = true;
+        break;
+
+      case 'i':
+      case 'y':			/* For old-timers . . . */
+        match_icase = true;
+        break;
+
+      case 'L':
+        /* Like -l, except list files that don't contain matches.
+           Inspired by the same option in Hume's gre. */
+        list_files = LISTFILES_NONMATCHING;
+        break;
+
+      case 'l':
+        list_files = LISTFILES_MATCHING;
+        break;
+
+      case 'm':
+        switch (xstrtoimax (optarg, 0, 10, &max_count, ""))
+          {
+          case LONGINT_OK:
+          case LONGINT_OVERFLOW:
+            break;
+
+          default:
+            error (EXIT_TROUBLE, 0, _("invalid max count"));
+          }
+        break;
+
+      case 'n':
+        out_line = true;
+        break;
+
+      case 'o':
+        only_matching = true;
+        break;
+
+      case 'q':
+        exit_on_match = true;
+        exit_failure = 0;
+        break;
+
+      case 'R':
+        fts_options = basic_fts_options | FTS_LOGICAL;
+        /* Fall through.  */
+      case 'r':
+        directories = RECURSE_DIRECTORIES;
+        last_recursive = prev_optind;
+        break;
+
+      case 's':
+        suppress_errors = true;
+        break;
+
+      case 'v':
+        out_invert = true;
+        break;
+
+      case 'w':
+        match_words = true;
+        break;
+
+      case 'x':
+        match_lines = true;
+        break;
+
+      case 'Z':
+        filename_mask = 0;
+        break;
+
+      case 'z':
+        eolbyte = '\0';
+        break;
+
+      case BINARY_FILES_OPTION:
+        if (STREQ (optarg, "binary"))
+          binary_files = BINARY_BINARY_FILES;
+        else if (STREQ (optarg, "text"))
+          binary_files = TEXT_BINARY_FILES;
+        else if (STREQ (optarg, "without-match"))
+          binary_files = WITHOUT_MATCH_BINARY_FILES;
+        else
+          error (EXIT_TROUBLE, 0, _("unknown binary-files type"));
+        break;
+
+      case COLOR_OPTION:
+        if (optarg)
+          {
+            if (!strcasecmp (optarg, "always") || !strcasecmp (optarg, "yes")
+                || !strcasecmp (optarg, "force"))
+              color_option = 1;
+            else if (!strcasecmp (optarg, "never") || !strcasecmp (optarg, "no")
+                     || !strcasecmp (optarg, "none"))
+              color_option = 0;
+            else if (!strcasecmp (optarg, "auto") || !strcasecmp (optarg, "tty")
+                     || !strcasecmp (optarg, "if-tty"))
+              color_option = 2;
+            else
+              show_help = 1;
+          }
+        else
+          color_option = 2;
+        break;
+
+      case EXCLUDE_OPTION:
+      case INCLUDE_OPTION:
+        for (int cmd = 0; cmd < 2; cmd++)
+          {
+            if (!excluded_patterns[cmd])
+              excluded_patterns[cmd] = new_exclude ();
+            add_exclude (excluded_patterns[cmd], optarg,
+                         ((opt == INCLUDE_OPTION ? EXCLUDE_INCLUDE : 0)
+                          | exclude_options (cmd)));
+          }
+        break;
+      case EXCLUDE_FROM_OPTION:
+        for (int cmd = 0; cmd < 2; cmd++)
+          {
+            if (!excluded_patterns[cmd])
+              excluded_patterns[cmd] = new_exclude ();
+            if (add_exclude_file (add_exclude, excluded_patterns[cmd],
+                                  optarg, exclude_options (cmd), '\n')
+                != 0)
+              error (EXIT_TROUBLE, errno, "%s", optarg);
+          }
+        break;
+
+      case EXCLUDE_DIRECTORY_OPTION:
+        strip_trailing_slashes (optarg);
+        for (int cmd = 0; cmd < 2; cmd++)
+          {
+            if (!excluded_directory_patterns[cmd])
+              excluded_directory_patterns[cmd] = new_exclude ();
+            add_exclude (excluded_directory_patterns[cmd], optarg,
+                         exclude_options (cmd));
+          }
+        break;
+
+      case GROUP_SEPARATOR_OPTION:
+        group_separator = optarg;
+        break;
+
+      case LINE_BUFFERED_OPTION:
+        line_buffered = true;
+        break;
+
+      case LABEL_OPTION:
+        label = optarg;
+        break;
+
+      case 0:
+        /* long options */
+        break;
+
+      default:
+        usage (EXIT_TROUBLE);
+        break;
+
+      }
+
+  if (show_version)
+    {
+      version_etc (stdout, getprogname(), PACKAGE_NAME, VERSION, AUTHORS,
+                   (char *) NULL);
+      return EXIT_SUCCESS;
+    }
+
+  if (show_help)
+    usage (EXIT_SUCCESS);
+
+  bool possibly_tty = false;
+  struct stat tmp_stat;
+  if (! exit_on_match && fstat (STDOUT_FILENO, &tmp_stat) == 0)
+    {
+      if (S_ISREG (tmp_stat.st_mode))
+        out_stat = tmp_stat;
+      else if (S_ISCHR (tmp_stat.st_mode))
+        {
+          struct stat null_stat;
+          if (stat ("/dev/null", &null_stat) == 0
+              && SAME_INODE (tmp_stat, null_stat))
+            exit_on_match = true;
+          else
+            possibly_tty = true;
+        }
+    }
+
+  if (color_option == 2)
+    color_option = possibly_tty && should_colorize () && isatty (STDOUT_FILENO);
+  init_colorize ();
+
+  if (color_option)
+    {
+      /* Legacy.  */
+      char *userval = getenv ("GREP_COLOR");
+      if (userval != NULL && *userval != '\0')
+        selected_match_color = context_match_color = userval;
+
+      /* New GREP_COLORS has priority.  */
+      parse_grep_colors ();
+    }
+
+  /* POSIX says -c, -l and -q are mutually exclusive.  In this
+     implementation, -q overrides -l and -L, which in turn override -c.  */
+  if (exit_on_match)
+    list_files = LISTFILES_NONE;
+  if (exit_on_match || list_files != LISTFILES_NONE)
+    {
+      count_matches = false;
+      done_on_match = true;
+    }
+  out_quiet = count_matches | done_on_match;
+
+  if (out_after < 0)
+    out_after = default_context;
+  if (out_before < 0)
+    out_before = default_context;
+
+  if (keys)
+    {
+      if (keycc == 0)
+        {
+          /* No keys were specified (e.g. -f /dev/null).  Match nothing.  */
+          out_invert ^= true;
+          match_lines = match_words = false;
+        }
+      else
+        /* Strip trailing newline. */
+        --keycc;
+    }
+  else if (optind < argc)
+    {
+      /* A copy must be made in case of an xrealloc() or free() later.  */
+      keycc = strlen (argv[optind]);
+      keys = xmemdup (argv[optind++], keycc + 1);
+      fl_add (keys, 0, keycc, "");
+    }
+  else
+    usage (EXIT_TROUBLE);
+
+  initialize_unibyte_mask ();
+
+  /* In a unibyte locale, switch from fgrep to grep if
+     the pattern matches words (where grep is typically faster).
+     In a multibyte locale, switch from fgrep to grep if either
+     (1) the pattern has an encoding error (where fgrep might not work), or
+     (2) case is ignored and a fast fgrep ignore-case is not available.  */
+  if (compile == Fcompile
+      && (MB_CUR_MAX <= 1
+          ? match_words
+          : (contains_encoding_error (keys, keycc)
+             || (match_icase && !fgrep_icase_available (keys, keycc)))))
+    {
+      fgrep_to_grep_pattern (&keys, &keycc);
+      matcher = "grep";
+      compile = Gcompile;
+      execute = EGexecute;
+    }
+
+  compile (keys, keycc);
+  free (keys);
+  /* We need one byte prior and one after.  */
+  char eolbytes[3] = { 0, eolbyte, 0 };
+  size_t match_size;
+  skip_empty_lines = ((execute (eolbytes + 1, 1, &match_size, NULL) == 0)
+                      == out_invert);
+
+  if ((argc - optind > 1 && !no_filenames) || with_filenames)
+    out_file = 1;
+
+#ifdef SET_BINARY
+  /* Output is set to binary mode because we shouldn't convert
+     NL to CR-LF pairs, especially when grepping binary files.  */
+  if (!isatty (STDOUT_FILENO))
+    SET_BINARY (STDOUT_FILENO);
+#endif
+
+  if (max_count == 0)
+    return EXIT_FAILURE;
+
+  /* Prefer sysconf for page size, as getpagesize typically returns int.  */
+#ifdef _SC_PAGESIZE
+  long psize = sysconf (_SC_PAGESIZE);
+#else
+  long psize = getpagesize ();
+#endif
+  if (! (0 < psize && psize <= (SIZE_MAX - sizeof (uword)) / 2))
+    abort ();
+  pagesize = psize;
+  bufalloc = ALIGN_TO (INITIAL_BUFSIZE, pagesize) + pagesize + sizeof (uword);
+  buffer = xmalloc (bufalloc);
+
+  if (fts_options & FTS_LOGICAL && devices == READ_COMMAND_LINE_DEVICES)
+    devices = READ_DEVICES;
+
+  char *const *files;
+  if (optind < argc)
+    {
+      files = argv + optind;
+    }
+  else if (directories == RECURSE_DIRECTORIES && prepended < last_recursive)
+    {
+      static char *const cwd_only[] = { (char *) ".", NULL };
+      files = cwd_only;
+      omit_dot_slash = true;
+    }
+  else
+    {
+      static char *const stdin_only[] = { (char *) "-", NULL };
+      files = stdin_only;
+    }
+
+  bool status = true;
+  do
+    status &= grep_command_line_arg (*files++);
+  while (*files != NULL);
+
+  /* We register via atexit() to test stdout.  */
+  return errseen ? EXIT_TROUBLE : status;
+}
+/* kwsearch.c - searching subroutines using kwset for grep.
+   Copyright 1992, 1998, 2000, 2007, 2009-2016 Free Software Foundation, Inc.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 3, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA
+   02110-1301, USA.  */
+
+/* Written August 1992 by Mike Haertel. */
+
+#include <config.h>
+#include "search.h"
+
+/* Whether -w considers WC to be a word constituent.  */
+static bool
+wordchar (wint_t wc)
+{
+  return wc == L'_' || iswalnum (wc);
+}
+
+/* KWset compiled pattern.  For Ecompile and Gcompile, we compile
+   a list of strings, at least one of which is known to occur in
+   any string matching the regexp. */
+static kwset_t kwset;
+
+void
+Fcompile (char const *pattern, size_t size)
+{
+  size_t total = size;
+
+  kwset = kwsinit (true);
+
+  char const *p = pattern;
+  do
+    {
+      size_t len;
+      char const *sep = memchr (p, '\n', total);
+      if (sep)
+        {
+          len = sep - p;
+          sep++;
+          total -= (len + 1);
+        }
+      else
+        {
+          len = total;
+          total = 0;
+        }
+
+      char *buf = NULL;
+      if (match_lines)
+        {
+          buf = xmalloc (len + 2);
+          buf[0] = eolbyte;
+          memcpy (buf + 1, p, len);
+          buf[len + 1] = eolbyte;
+          p = buf;
+          len += 2;
+        }
+      kwsincr (kwset, p, len);
+      free (buf);
+
+      p = sep;
+    }
+  while (p);
+
+  kwsprep (kwset);
+}
+
+size_t
+Fexecute (char *buf, size_t size, size_t *match_size,
+          char const *start_ptr)
+{
+  char const *beg, *try, *end, *mb_start;
+  size_t len;
+  char eol = eolbyte;
+  struct kwsmatch kwsmatch;
+  size_t ret_val;
+  bool mb_check;
+  bool longest;
+
+  if (match_lines)
+    mb_check = longest = false;
+  else
+    {
+      mb_check = MB_CUR_MAX > 1 && !localeinfo.using_utf8;
+      longest = mb_check | !!start_ptr | match_words;
+    }
+
+  for (mb_start = beg = start_ptr ? start_ptr : buf; beg <= buf + size; beg++)
+    {
+      size_t offset = kwsexec (kwset, beg - match_lines,
+                               buf + size - beg + match_lines, &kwsmatch,
+                               longest);
+      if (offset == (size_t) -1)
+        goto failure;
+      len = kwsmatch.size[0] - 2 * match_lines;
+      if (mb_check && mb_goback (&mb_start, beg + offset, buf + size) != 0)
+        {
+          /* We have matched a single byte that is not at the beginning of a
+             multibyte character.  mb_goback has advanced MB_START past that
+             multibyte character.  Now, we want to position BEG so that the
+             next kwsexec search starts there.  Thus, to compensate for the
+             for-loop's BEG++, above, subtract one here.  This code is
+             unusually hard to reach, and exceptionally, let's show how to
+             trigger it here:
+
+               printf '\203AA\n'|LC_ALL=ja_JP.SHIFT_JIS src/grep -F A
+
+             That assumes the named locale is installed.
+             Note that your system's shift-JIS locale may have a different
+             name, possibly including "sjis".  */
+          beg = mb_start - 1;
+          continue;
+        }
+      beg += offset;
+      if (!!start_ptr & !match_words)
+        goto success_in_beg_and_len;
+      if (match_lines)
+        {
+          len += start_ptr == NULL;
+          goto success_in_beg_and_len;
+        }
+      if (match_words)
+        for (try = beg; ; )
+          {
+            char const *bol = memrchr (buf, eol, beg - buf);
+            bol = bol ? bol + 1 : buf;
+            if (wordchar (mb_prev_wc (bol, try, buf + size)))
+              break;
+            if (wordchar (mb_next_wc (try + len, buf + size)))
+              {
+                if (!len)
+                  break;
+                offset = kwsexec (kwset, beg, --len, &kwsmatch, true);
+                if (offset == (size_t) -1)
+                  break;
+                try = beg + offset;
+                len = kwsmatch.size[0];
+              }
+            else if (!start_ptr)
+              goto success;
+            else
+              goto success_in_beg_and_len;
+          } /* for (try) */
+      else
+        goto success;
+    } /* for (beg in buf) */
+
+ failure:
+  return -1;
+
+ success:
+  end = memchr (beg + len, eol, (buf + size) - (beg + len));
+  end = end ? end + 1 : buf + size;
+  beg = memrchr (buf, eol, beg - buf);
+  beg = beg ? beg + 1 : buf;
+  len = end - beg;
+ success_in_beg_and_len:;
+  size_t off = beg - buf;
+
+  *match_size = len;
+  ret_val = off;
+  return ret_val;
+}
+/* kwset.c - search for any of a set of keywords.
+   Copyright (C) 1989, 1998, 2000, 2005, 2007, 2009-2016 Free Software
+   Foundation, Inc.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 3, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA
+   02110-1301, USA.  */
+
+/* Written August 1989 by Mike Haertel.
+   The author may be reached (Email) at the address mike@ai.mit.edu,
+   or (US mail) as Mike Haertel c/o Free Software Foundation. */
+
+/* The algorithm implemented by these routines bears a startling resemblance
+   to one discovered by Beate Commentz-Walter, although it is not identical.
+   See: Commentz-Walter B. A string matching algorithm fast on the average.
+   Lecture Notes in Computer Science 71 (1979), 118-32
+   <http://dx.doi.org/10.1007/3-540-09510-1_10>.
+   See also: Aho AV, Corasick MJ. Efficient string matching: an aid to
+   bibliographic search. CACM 18, 6 (1975), 333-40
+   <http://dx.doi.org/10.1145/360825.360855>, which describes the
+   failure function used below. */
+
+#include <config.h>
+
+#include "kwset.h"
+
+#include <stdint.h>
+#include <sys/types.h>
+#include "system.h"
+#include "memchr2.h"
+#include "obstack.h"
+#include "xalloc.h"
+
+#define link kwset_link
+
+#ifdef GREP
+# include "xalloc.h"
+# undef malloc
+# define malloc xmalloc
+#endif
+
+#define NCHAR (UCHAR_MAX + 1)
+#define obstack_chunk_alloc malloc
+#define obstack_chunk_free free
+
+#define U(c) to_uchar (c)
+
+/* Balanced tree of edges and labels leaving a given trie node. */
+struct tree
+{
+  struct tree *llink;		/* Left link; MUST be first field. */
+  struct tree *rlink;		/* Right link (to larger labels). */
+  struct trie *trie;		/* Trie node pointed to by this edge. */
+  unsigned char label;		/* Label on this edge. */
+  char balance;			/* Difference in depths of subtrees. */
+};
+
+/* Node of a trie representing a set of keywords. */
+struct trie
+{
+  size_t accepting;		/* Word index of accepted word, or zero. */
+  struct tree *links;		/* Tree of edges leaving this node. */
+  struct trie *parent;		/* Parent of this node. */
+  struct trie *next;		/* List of all trie nodes in level order. */
+  struct trie *fail;		/* Aho-Corasick failure function. */
+  int depth;			/* Depth of this node from the root. */
+  int shift;			/* Shift function for search failures. */
+  int maxshift;			/* Max shift of self and descendants. */
+};
+
+/* Structure returned opaquely to the caller, containing everything. */
+struct kwset
+{
+  struct obstack obstack;	/* Obstack for node allocation. */
+  ptrdiff_t words;		/* Number of words in the trie. */
+  struct trie *trie;		/* The trie itself. */
+  int mind;			/* Minimum depth of an accepting node. */
+  int maxd;			/* Maximum depth of any node. */
+  unsigned char delta[NCHAR];	/* Delta table for rapid search. */
+  struct trie *next[NCHAR];	/* Table of children of the root. */
+  char *target;			/* Target string if there's only one. */
+  int *shift;			/* Used in Boyer-Moore search for one string. */
+  char const *trans;		/* Character translation table. */
+
+  /* If there's only one string, this is the string's last byte,
+     translated via TRANS if TRANS is nonnull.  */
+  char gc1;
+
+  /* Likewise for the string's penultimate byte, if it has two or more
+     bytes.  */
+  char gc2;
+
+  /* If there's only one string, this helps to match the string's last byte.
+     If GC1HELP is negative, only GC1 matches the string's last byte;
+     otherwise at least two bytes match, and B matches if TRANS[B] == GC1.
+     If GC1HELP is in the range 0..(NCHAR - 1), there are exactly two
+     such matches, and GC1HELP is the other match after conversion to
+     unsigned char.  If GC1HELP is at least NCHAR, there are three or
+     more such matches; e.g., Greek has three sigma characters that
+     all match when case-folding.  */
+  int gc1help;
+
+  /* If true, prefer Aho-Corasick algorithm to Beate Commentz-Walter
+     algorithm in multiple words.  */
+  bool reverse;
+
+  /* kwsexec implementation.  */
+  size_t (*kwsexec) (kwset_t, char const *, size_t, struct kwsmatch *, bool);
+};
+
+/* Use TRANS to transliterate C.  A null TRANS does no transliteration.  */
+static inline char
+tr (char const *trans, char c)
+{
+  return trans ? trans[U(c)] : c;
+}
+
+static size_t acexec (kwset_t, char const *, size_t, struct kwsmatch *, bool);
+static size_t cwexec (kwset_t, char const *, size_t, struct kwsmatch *, bool);
+static size_t bmexec (kwset_t, char const *, size_t, struct kwsmatch *, bool);
+
+/* Allocate and initialize a keyword set object, returning an opaque
+   pointer to it.  */
+kwset_t
+kwsalloc (char const *trans, bool reverse)
+{
+  struct kwset *kwset = xmalloc (sizeof *kwset);
+
+  obstack_init (&kwset->obstack);
+  kwset->words = 0;
+  kwset->trie = obstack_alloc (&kwset->obstack, sizeof *kwset->trie);
+  kwset->trie->accepting = 0;
+  kwset->trie->links = NULL;
+  kwset->trie->parent = NULL;
+  kwset->trie->next = NULL;
+  kwset->trie->fail = NULL;
+  kwset->trie->depth = 0;
+  kwset->trie->shift = 0;
+  kwset->mind = INT_MAX;
+  kwset->maxd = -1;
+  kwset->target = NULL;
+  kwset->trans = trans;
+  kwset->reverse = reverse;
+  kwset->kwsexec = reverse ? cwexec : acexec;
+
+  return kwset;
+}
+
+/* This upper bound is valid for CHAR_BIT >= 4 and
+   exact for CHAR_BIT in { 4..11, 13, 15, 17, 19 }. */
+#define DEPTH_SIZE (CHAR_BIT + CHAR_BIT/2)
+
+/* Add the given string to the contents of the keyword set.  */
+void
+kwsincr (kwset_t kwset, char const *text, size_t len)
+{
+  struct trie *trie = kwset->trie;
+  char const *trans = kwset->trans;
+
+  if (kwset->reverse)
+    text += len;
+
+  /* Descend the trie (built of keywords) character-by-character,
+     installing new nodes when necessary. */
+  while (len--)
+    {
+      unsigned char uc = kwset->reverse ? *--text : *text++;
+      unsigned char label = trans ? trans[uc] : uc;
+
+      /* Descend the tree of outgoing links for this trie node,
+         looking for the current character and keeping track
+         of the path followed. */
+      struct tree *link = trie->links;
+      struct tree *links[DEPTH_SIZE];
+      enum { L, R } dirs[DEPTH_SIZE];
+      links[0] = (struct tree *) &trie->links;
+      dirs[0] = L;
+      int depth = 1;
+
+      while (link && label != link->label)
+        {
+          links[depth] = link;
+          if (label < link->label)
+            dirs[depth++] = L, link = link->llink;
+          else
+            dirs[depth++] = R, link = link->rlink;
+        }
+
+      /* The current character doesn't have an outgoing link at
+         this trie node, so build a new trie node and install
+         a link in the current trie node's tree. */
+      if (!link)
+        {
+          link = obstack_alloc (&kwset->obstack, sizeof *link);
+          link->llink = NULL;
+          link->rlink = NULL;
+          link->trie = obstack_alloc (&kwset->obstack, sizeof *link->trie);
+          link->trie->accepting = 0;
+          link->trie->links = NULL;
+          link->trie->parent = trie;
+          link->trie->next = NULL;
+          link->trie->fail = NULL;
+          link->trie->depth = trie->depth + 1;
+          link->trie->shift = 0;
+          link->label = label;
+          link->balance = 0;
+
+          /* Install the new tree node in its parent. */
+          if (dirs[--depth] == L)
+            links[depth]->llink = link;
+          else
+            links[depth]->rlink = link;
+
+          /* Back up the tree fixing the balance flags. */
+          while (depth && !links[depth]->balance)
+            {
+              if (dirs[depth] == L)
+                --links[depth]->balance;
+              else
+                ++links[depth]->balance;
+              --depth;
+            }
+
+          /* Rebalance the tree by pointer rotations if necessary. */
+          if (depth && ((dirs[depth] == L && --links[depth]->balance)
+                        || (dirs[depth] == R && ++links[depth]->balance)))
+            {
+              struct tree *t, *r, *l, *rl, *lr;
+
+              switch (links[depth]->balance)
+                {
+                case (char) -2:
+                  switch (dirs[depth + 1])
+                    {
+                    case L:
+                      r = links[depth], t = r->llink, rl = t->rlink;
+                      t->rlink = r, r->llink = rl;
+                      t->balance = r->balance = 0;
+                      break;
+                    case R:
+                      r = links[depth], l = r->llink, t = l->rlink;
+                      rl = t->rlink, lr = t->llink;
+                      t->llink = l, l->rlink = lr, t->rlink = r, r->llink = rl;
+                      l->balance = t->balance != 1 ? 0 : -1;
+                      r->balance = t->balance != (char) -1 ? 0 : 1;
+                      t->balance = 0;
+                      break;
+                    default:
+                      abort ();
+                    }
+                  break;
+                case 2:
+                  switch (dirs[depth + 1])
+                    {
+                    case R:
+                      l = links[depth], t = l->rlink, lr = t->llink;
+                      t->llink = l, l->rlink = lr;
+                      t->balance = l->balance = 0;
+                      break;
+                    case L:
+                      l = links[depth], r = l->rlink, t = r->llink;
+                      lr = t->llink, rl = t->rlink;
+                      t->llink = l, l->rlink = lr, t->rlink = r, r->llink = rl;
+                      l->balance = t->balance != 1 ? 0 : -1;
+                      r->balance = t->balance != (char) -1 ? 0 : 1;
+                      t->balance = 0;
+                      break;
+                    default:
+                      abort ();
+                    }
+                  break;
+                default:
+                  abort ();
+                }
+
+              if (dirs[depth - 1] == L)
+                links[depth - 1]->llink = t;
+              else
+                links[depth - 1]->rlink = t;
+            }
+        }
+
+      trie = link->trie;
+    }
+
+  /* Mark the node we finally reached as accepting, encoding the
+     index number of this word in the keyword set so far. */
+  if (!trie->accepting)
+    trie->accepting = 1 + 2 * kwset->words;
+  ++kwset->words;
+
+  /* Keep track of the longest and shortest string of the keyword set. */
+  if (trie->depth < kwset->mind)
+    kwset->mind = trie->depth;
+  if (trie->depth > kwset->maxd)
+    kwset->maxd = trie->depth;
+}
+
+/* Enqueue the trie nodes referenced from the given tree in the
+   given queue. */
+static void
+enqueue (struct tree *tree, struct trie **last)
+{
+  if (!tree)
+    return;
+  enqueue(tree->llink, last);
+  enqueue(tree->rlink, last);
+  (*last) = (*last)->next = tree->trie;
+}
+
+/* Compute the Aho-Corasick failure function for the trie nodes referenced
+   from the given tree, given the failure function for their parent as
+   well as a last resort failure node. */
+static void
+treefails (struct tree const *tree, struct trie const *fail,
+           struct trie *recourse, bool reverse)
+{
+  struct tree *link;
+
+  if (!tree)
+    return;
+
+  treefails(tree->llink, fail, recourse, reverse);
+  treefails(tree->rlink, fail, recourse, reverse);
+
+  /* Find, in the chain of fails going back to the root, the first
+     node that has a descendant on the current label. */
+  while (fail)
+    {
+      link = fail->links;
+      while (link && tree->label != link->label)
+        if (tree->label < link->label)
+          link = link->llink;
+        else
+          link = link->rlink;
+      if (link)
+        {
+          tree->trie->fail = link->trie;
+          if (!reverse && link->trie->accepting && !tree->trie->accepting)
+            tree->trie->accepting = SIZE_MAX;
+          return;
+        }
+      fail = fail->fail;
+    }
+
+  tree->trie->fail = recourse;
+}
+
+/* Set delta entries for the links of the given tree such that
+   the preexisting delta value is larger than the current depth. */
+static void
+treedelta (struct tree const *tree,
+           unsigned int depth,
+           unsigned char delta[])
+{
+  if (!tree)
+    return;
+  treedelta(tree->llink, depth, delta);
+  treedelta(tree->rlink, depth, delta);
+  if (depth < delta[tree->label])
+    delta[tree->label] = depth;
+}
+
+/* Return true if A has every label in B. */
+static int _GL_ATTRIBUTE_PURE
+hasevery (struct tree const *a, struct tree const *b)
+{
+  if (!b)
+    return 1;
+  if (!hasevery(a, b->llink))
+    return 0;
+  if (!hasevery(a, b->rlink))
+    return 0;
+  while (a && b->label != a->label)
+    if (b->label < a->label)
+      a = a->llink;
+    else
+      a = a->rlink;
+  return !!a;
+}
+
+/* Compute a vector, indexed by character code, of the trie nodes
+   referenced from the given tree. */
+static void
+treenext (struct tree const *tree, struct trie *next[])
+{
+  if (!tree)
+    return;
+  treenext(tree->llink, next);
+  treenext(tree->rlink, next);
+  next[tree->label] = tree->trie;
+}
+
+/* Compute the shift for each trie node, as well as the delta
+   table and next cache for the given keyword set. */
+void
+kwsprep (kwset_t kwset)
+{
+  char const *trans = kwset->trans;
+  int i;
+  unsigned char deltabuf[NCHAR];
+  unsigned char *delta = trans ? deltabuf : kwset->delta;
+  struct trie *curr, *last;
+
+  if (kwset->words == 1)
+    {
+      if (!kwset->reverse)
+        {
+          kwset_t new_kwset;
+
+          /* Enqueue the immediate descendants in the level order queue.  */
+          for (curr = last = kwset->trie; curr; curr = curr->next)
+             enqueue (curr->links, &last);
+
+          /* Looking for just one string.  Extract it from the trie.  */
+          kwset->target = obstack_alloc (&kwset->obstack, kwset->mind);
+          for (i = 0, curr = kwset->trie; i < kwset->mind; ++i)
+            {
+              kwset->target[i] = curr->links->label;
+              curr = curr->next;
+            }
+
+          new_kwset = kwsalloc (kwset->trans, true);
+          kwsincr (new_kwset, kwset->target, kwset->mind);
+          obstack_free (&kwset->obstack, NULL);
+          *kwset = *new_kwset;
+          free (new_kwset);
+        }
+      kwset->kwsexec = bmexec;
+    }
+
+  /* Initial values for the delta table; will be changed later.  The
+     delta entry for a given character is the smallest depth of any
+     node at which an outgoing edge is labeled by that character. */
+  memset (delta, MIN (kwset->mind, UCHAR_MAX), sizeof deltabuf);
+
+  /* Traverse the nodes of the trie in level order, simultaneously
+     computing the delta table, failure function, and shift function.  */
+  for (curr = last = kwset->trie; curr; curr = curr->next)
+    {
+      /* Enqueue the immediate descendants in the level order queue.  */
+      enqueue (curr->links, &last);
+
+      /* Update the delta table for the descendants of this node.  */
+      treedelta (curr->links, curr->depth, delta);
+
+      /* Compute the failure function for the descendants of this node.  */
+      treefails (curr->links, curr->fail, kwset->trie, kwset->reverse);
+
+      if (kwset->reverse)
+        {
+          curr->shift = kwset->mind;
+          curr->maxshift = kwset->mind;
+
+          /* Update the shifts at each node in the current node's chain
+             of fails back to the root.  */
+          struct trie *fail;
+          for (fail = curr->fail; fail; fail = fail->fail)
+            {
+              /* If the current node has some outgoing edge that the fail
+                 doesn't, then the shift at the fail should be no larger
+                 than the difference of their depths.  */
+              if (!hasevery (fail->links, curr->links))
+                if (curr->depth - fail->depth < fail->shift)
+                  fail->shift = curr->depth - fail->depth;
+
+              /* If the current node is accepting then the shift at the
+                 fail and its descendants should be no larger than the
+                 difference of their depths.  */
+              if (curr->accepting && fail->maxshift > curr->depth - fail->depth)
+                fail->maxshift = curr->depth - fail->depth;
+            }
+        }
+    }
+
+  if (kwset->reverse)
+    {
+      /* Traverse the trie in level order again, fixing up all nodes whose
+         shift exceeds their inherited maxshift.  */
+      for (curr = kwset->trie->next; curr; curr = curr->next)
+        {
+          if (curr->maxshift > curr->parent->maxshift)
+            curr->maxshift = curr->parent->maxshift;
+          if (curr->shift > curr->maxshift)
+            curr->shift = curr->maxshift;
+        }
+    }
+
+  /* Create a vector, indexed by character code, of the outgoing links
+     from the root node.  */
+  struct trie *nextbuf[NCHAR];
+  struct trie **next = trans ? nextbuf : kwset->next;
+  memset (next, 0, sizeof nextbuf);
+  treenext (kwset->trie->links, next);
+  if (trans)
+    for (i = 0; i < NCHAR; ++i)
+      kwset->next[i] = next[U(trans[i])];
+
+  /* Check if we can use the simple boyer-moore algorithm, instead
+     of the hairy commentz-walter algorithm. */
+  if (kwset->words == 1)
+    {
+      /* Looking for just one string.  Extract it from the trie. */
+      kwset->target = obstack_alloc (&kwset->obstack, kwset->mind);
+      for (i = kwset->mind - 1, curr = kwset->trie; i >= 0; --i)
+        {
+          kwset->target[i] = curr->links->label;
+          curr = curr->next;
+        }
+
+      /* Looking for the delta2 shift that we might make after a
+         backwards match has failed.  Extract it from the trie.  */
+      if (kwset->mind > 1)
+        {
+          kwset->shift
+            = obstack_alloc (&kwset->obstack,
+                             sizeof *kwset->shift * (kwset->mind - 1));
+          for (i = 0, curr = kwset->trie->next; i < kwset->mind - 1; ++i)
+            {
+              kwset->shift[i] = curr->shift;
+              curr = curr->next;
+            }
+        }
+
+      char gc1 = tr (trans, kwset->target[kwset->mind - 1]);
+
+      /* Set GC1HELP according to whether exactly one, exactly two, or
+         three-or-more characters match GC1.  */
+      int gc1help = -1;
+      if (trans)
+        {
+          char const *equiv1 = memchr (trans, gc1, NCHAR);
+          char const *equiv2 = memchr (equiv1 + 1, gc1,
+                                       trans + NCHAR - (equiv1 + 1));
+          if (equiv2)
+            gc1help = (memchr (equiv2 + 1, gc1, trans + NCHAR - (equiv2 + 1))
+                       ? NCHAR
+                       : U(gc1) ^ (equiv1 - trans) ^ (equiv2 - trans));
+        }
+
+      kwset->gc1 = gc1;
+      kwset->gc1help = gc1help;
+      if (kwset->mind > 1)
+        kwset->gc2 = tr (trans, kwset->target[kwset->mind - 2]);
+    }
+
+  /* Fix things up for any translation table. */
+  if (trans)
+    for (i = 0; i < NCHAR; ++i)
+      kwset->delta[i] = delta[U(trans[i])];
+}
+
+/* Delta2 portion of a Boyer-Moore search.  *TP is the string text
+   pointer; it is updated in place.  EP is the end of the string text,
+   and SP the end of the pattern.  LEN is the pattern length; it must
+   be at least 2.  TRANS, if nonnull, is the input translation table.
+   GC1 and GC2 are the last and second-from last bytes of the pattern,
+   transliterated by TRANS; the caller precomputes them for
+   efficiency.  If D1 is nonnull, it is a delta1 table for shifting *TP
+   when failing.  KWSET->shift says how much to shift.  */
+static inline bool
+bm_delta2_search (char const **tpp, char const *ep, char const *sp, int len,
+                  char const *trans, char gc1, char gc2,
+                  unsigned char const *d1, kwset_t kwset)
+{
+  char const *tp = *tpp;
+  int d = len, skip = 0;
+
+  while (true)
+    {
+      int i = 2;
+      if (tr (trans, tp[-2]) == gc2)
+        {
+          while (++i <= d)
+            if (tr (trans, tp[-i]) != tr (trans, sp[-i]))
+              break;
+          if (i > d)
+            {
+              for (i = d + skip + 1; i <= len; ++i)
+                if (tr (trans, tp[-i]) != tr (trans, sp[-i]))
+                  break;
+              if (i > len)
+                {
+                  *tpp = tp - len;
+                  return true;
+                }
+            }
+        }
+
+      tp += d = kwset->shift[i - 2];
+      if (tp > ep)
+        break;
+      if (tr (trans, tp[-1]) != gc1)
+        {
+          if (d1)
+            tp += d1[U(tp[-1])];
+          break;
+        }
+      skip = i - 1;
+    }
+
+  *tpp = tp;
+  return false;
+}
+
+/* Return the address of the first byte in the buffer S (of size N)
+   that matches the last byte specified by KWSET, a singleton.
+   Return NULL if there is no match.  */
+static char const *
+memchr_kwset (char const *s, size_t n, kwset_t kwset)
+{
+  if (kwset->gc1help < 0)
+    return memchr (s, kwset->gc1, n);
+  int small_heuristic = 2;
+  int small = (- (uintptr_t) s % sizeof (long)
+               + small_heuristic * sizeof (long));
+  size_t ntrans = kwset->gc1help < NCHAR && small < n ? small : n;
+  char const *slim = s + ntrans;
+  for (; s < slim; s++)
+    if (kwset->trans[U(*s)] == kwset->gc1)
+      return s;
+  n -= ntrans;
+  return n == 0 ? NULL : memchr2 (s, kwset->gc1, kwset->gc1help, n);
+}
+
+/* Return the offset of the first byte in the buffer S (of size N)
+   that matches the last byte specified by KWSET, a pair.
+   Return SIZE_MAX if there is no match.  */
+static size_t
+memoff2_kwset (char const *s, size_t n, kwset_t kwset,
+               struct kwsmatch *kwsmatch)
+{
+  struct tree const *link = kwset->trie->links;
+  struct tree const *clink = link->llink ? link->llink : link->rlink;
+  char const *mch = (clink
+                     ? memchr2 (s, link->label, clink->label, n)
+                     : memchr (s, link->label, n));
+  if (! mch)
+    return SIZE_MAX;
+  else
+    {
+      size_t off = mch - s;
+      if (*mch == link->label)
+        kwsmatch->index = link->trie->accepting / 2;
+      else
+        kwsmatch->index = clink->trie->accepting / 2;
+      kwsmatch->offset[0] = off;
+      kwsmatch->size[0] = 1;
+      return off;
+    }
+}
+
+/* Fast Boyer-Moore search (inlinable version).  */
+static inline size_t
+bmexec_trans (kwset_t kwset, char const *text, size_t size)
+{
+  unsigned char const *d1;
+  char const *ep, *sp, *tp;
+  int d;
+  int len = kwset->mind;
+  char const *trans = kwset->trans;
+
+  if (len == 0)
+    return 0;
+  if (len > size)
+    return SIZE_MAX;
+  if (len == 1)
+    {
+      tp = memchr_kwset (text, size, kwset);
+      return tp ? tp - text : SIZE_MAX;
+    }
+
+  d1 = kwset->delta;
+  sp = kwset->target + len;
+  tp = text + len;
+  char gc1 = kwset->gc1;
+  char gc2 = kwset->gc2;
+
+  /* Significance of 12: 1 (initial offset) + 10 (skip loop) + 1 (md2). */
+  if (size > 12 * len)
+    /* 11 is not a bug, the initial offset happens only once. */
+    for (ep = text + size - 11 * len; tp <= ep; )
+      {
+        char const *tp0 = tp;
+        d = d1[U(tp[-1])], tp += d;
+        d = d1[U(tp[-1])], tp += d;
+        if (d != 0)
+          {
+            d = d1[U(tp[-1])], tp += d;
+            d = d1[U(tp[-1])], tp += d;
+            d = d1[U(tp[-1])], tp += d;
+            if (d != 0)
+              {
+                d = d1[U(tp[-1])], tp += d;
+                d = d1[U(tp[-1])], tp += d;
+                d = d1[U(tp[-1])], tp += d;
+                if (d != 0)
+                  {
+                    d = d1[U(tp[-1])], tp += d;
+                    d = d1[U(tp[-1])], tp += d;
+
+                    /* As a heuristic, prefer memchr to seeking by
+                       delta1 when the latter doesn't advance much.  */
+                    int advance_heuristic = 16 * sizeof (long);
+                    if (advance_heuristic <= tp - tp0)
+                      continue;
+                    tp--;
+                    tp = memchr_kwset (tp, text + size - tp, kwset);
+                    if (! tp)
+                      return SIZE_MAX;
+                    tp++;
+                    if (ep <= tp)
+                      break;
+                  }
+              }
+          }
+        if (bm_delta2_search (&tp, ep, sp, len, trans, gc1, gc2, d1, kwset))
+          return tp - text;
+      }
+
+  /* Now we have only a few characters left to search.  We
+     carefully avoid ever producing an out-of-bounds pointer. */
+  ep = text + size;
+  d = d1[U(tp[-1])];
+  while (d <= ep - tp)
+    {
+      d = d1[U((tp += d)[-1])];
+      if (d != 0)
+        continue;
+      if (bm_delta2_search (&tp, ep, sp, len, trans, gc1, gc2, NULL, kwset))
+        return tp - text;
+    }
+
+  return SIZE_MAX;
+}
+
+/* Fast Boyer-Moore search.  */
+static size_t
+bmexec (kwset_t kwset, char const *text, size_t size,
+        struct kwsmatch *kwsmatch, bool longest)
+{
+  /* Help the compiler inline bmexec_trans in two ways, depending on
+     whether kwset->trans is null.  */
+  size_t ret = (kwset->trans
+                ? bmexec_trans (kwset, text, size)
+                : bmexec_trans (kwset, text, size));
+
+  if (ret != SIZE_MAX)
+    {
+       kwsmatch->index = 0;
+       kwsmatch->offset[0] = ret;
+       kwsmatch->size[0] = kwset->mind;
+    }
+
+  return ret;
+}
+
+/* Hairy multiple string search with Commentz-Walter algorithm.  */
+static size_t
+cwexec (kwset_t kwset, char const *text, size_t len,
+        struct kwsmatch *kwsmatch, bool longest)
+{
+  struct trie * const *next;
+  struct trie const *trie;
+  struct trie const *accept;
+  char const *beg, *lim, *mch, *lmch;
+  unsigned char c;
+  unsigned char const *delta;
+  int d;
+  char const *end, *qlim;
+  struct tree const *tree;
+  char const *trans;
+
+  /* Initialize register copies and look for easy ways out.  */
+  if (len < kwset->mind)
+    return SIZE_MAX;
+  if (!kwset->trans && kwset->maxd == 1 && kwset->words == 2)
+    return memoff2_kwset (text, len, kwset, kwsmatch);
+  next = kwset->next;
+  delta = kwset->delta;
+  trans = kwset->trans;
+  lim = text + len;
+  end = text;
+  if ((d = kwset->mind) != 0)
+    mch = NULL;
+  else
+    {
+      mch = text, accept = kwset->trie;
+      goto match;
+    }
+
+  if (len >= 4 * kwset->mind)
+    qlim = lim - 4 * kwset->mind;
+  else
+    qlim = NULL;
+
+  while (lim - end >= d)
+    {
+      if (qlim && end <= qlim)
+        {
+          end += d - 1;
+          while ((d = delta[c = *end]) && end < qlim)
+            {
+              end += d;
+              end += delta[U(*end)];
+              end += delta[U(*end)];
+            }
+          ++end;
+        }
+      else
+        d = delta[c = (end += d)[-1]];
+      if (d)
+        continue;
+      beg = end - 1;
+      trie = next[c];
+      if (trie->accepting)
+        {
+          mch = beg;
+          accept = trie;
+        }
+      d = trie->shift;
+      while (beg > text)
+        {
+          unsigned char uc = *--beg;
+          c = trans ? trans[uc] : uc;
+          tree = trie->links;
+          while (tree && c != tree->label)
+            if (c < tree->label)
+              tree = tree->llink;
+            else
+              tree = tree->rlink;
+          if (tree)
+            {
+              trie = tree->trie;
+              if (trie->accepting)
+                {
+                  mch = beg;
+                  accept = trie;
+                }
+            }
+          else
+            break;
+          d = trie->shift;
+        }
+      if (mch)
+        goto match;
+    }
+  return SIZE_MAX;
+
+ match:
+  /* Given a known match, find the longest possible match anchored
+     at or before its starting point.  This is nearly a verbatim
+     copy of the preceding main search loops. */
+  if (longest)
+    {
+      if (lim - mch > kwset->maxd)
+        lim = mch + kwset->maxd;
+      lmch = 0;
+      d = 1;
+      while (lim - end >= d)
+        {
+          if ((d = delta[c = (end += d)[-1]]) != 0)
+            continue;
+          beg = end - 1;
+          if (!(trie = next[c]))
+            {
+              d = 1;
+              continue;
+            }
+          if (trie->accepting && beg <= mch)
+            {
+              lmch = beg;
+              accept = trie;
+            }
+          d = trie->shift;
+          while (beg > text)
+            {
+              unsigned char uc = *--beg;
+              c = trans ? trans[uc] : uc;
+              tree = trie->links;
+              while (tree && c != tree->label)
+                if (c < tree->label)
+                  tree = tree->llink;
+                else
+                  tree = tree->rlink;
+              if (tree)
+                {
+                  trie = tree->trie;
+                  if (trie->accepting && beg <= mch)
+                    {
+                      lmch = beg;
+                      accept = trie;
+                    }
+                }
+              else
+                break;
+              d = trie->shift;
+            }
+          if (lmch)
+            {
+              mch = lmch;
+              goto match;
+            }
+          if (!d)
+            d = 1;
+        }
+    }
+
+  kwsmatch->index = accept->accepting / 2;
+  kwsmatch->offset[0] = mch - text;
+  kwsmatch->size[0] = accept->depth;
+
+  return mch - text;
+}
+
+/* Hairy multiple string search with Aho-Corasick algorithm.
+   (inlinable version)  */
+static inline size_t
+acexec_trans (kwset_t kwset, char const *text, size_t len,
+              struct kwsmatch *kwsmatch, bool longest)
+{
+  struct trie * const *next;
+  struct trie const *trie, *accept;
+  char const *tp, *left, *lim;
+  struct tree const *tree;
+  char const *trans;
+
+  /* Initialize register copies and look for easy ways out.  */
+  if (len < kwset->mind)
+    return SIZE_MAX;
+  trans = kwset->trans;
+  if (!trans && kwset->maxd == 1 && kwset->words == 2)
+    return memoff2_kwset (text, len, kwset, kwsmatch);
+
+  next = kwset->next;
+  trie = kwset->trie;
+  lim = text + len;
+  tp = text;
+
+  if (!trie->accepting)
+    {
+      unsigned char c = tr (trans, *tp++);
+
+      while (true)
+        {
+          while (! (trie = next[c]))
+            {
+              if (tp >= lim)
+                return SIZE_MAX;
+              c = tr (trans, *tp++);
+            }
+
+          while (true)
+            {
+              if (trie->accepting)
+                goto match;
+              if (tp >= lim)
+                return SIZE_MAX;
+              c = tr (trans, *tp++);
+
+              for (tree = trie->links; c != tree->label; )
+                {
+                  tree = c < tree->label ? tree->llink : tree->rlink;
+                  if (! tree)
+                    {
+                      trie = trie->fail;
+                      if (!trie)
+                        goto next_trie;
+                      if (trie->accepting)
+                        {
+                          --tp;
+                          goto match;
+                        }
+                      tree = trie->links;
+                    }
+                }
+              trie = tree->trie;
+            }
+        next_trie:;
+        }
+    }
+
+ match:
+  accept = trie;
+  while (accept->accepting == SIZE_MAX)
+    accept = accept->fail;
+  left = tp - accept->depth;
+
+  /* Try left-most longest match.  */
+  if (longest)
+    {
+      while (tp < lim)
+        {
+          struct trie const *accept1;
+          char const *left1;
+          unsigned char c = tr (trans, *tp++);
+          tree = trie->links;
+          while (tree && c != tree->label)
+            tree = c < tree->label ? tree->llink : tree->rlink;
+          if (!tree)
+            break;
+          trie = tree->trie;
+          if (trie->accepting)
+            {
+              accept1 = trie;
+              while (accept1->accepting == SIZE_MAX)
+                accept1 = accept1->fail;
+              left1 = tp - accept1->depth;
+              if (left1 <= left)
+                {
+                  left = left1;
+                  accept = accept1;
+                }
+            }
+        }
+    }
+
+  kwsmatch->index = accept->accepting / 2;
+  kwsmatch->offset[0] = left - text;
+  kwsmatch->size[0] = accept->depth;
+
+  return left - text;
+}
+
+/* Hairy multiple string search with Aho-Corasick algorithm.  */
+static size_t
+acexec (kwset_t kwset, char const *text, size_t size,
+        struct kwsmatch *kwsmatch, bool longest)
+{
+  /* Help the compiler inline bmexec_trans in two ways, depending on
+     whether kwset->trans is null.  */
+  return (kwset->trans
+          ? acexec_trans (kwset, text, size, kwsmatch, longest)
+          : acexec_trans (kwset, text, size, kwsmatch, longest));
+}
+
+/* Search TEXT for a match of any member of KWSET.
+   Return the offset (into TEXT) of the first byte of the matching substring,
+   or SIZE_MAX if no match is found.  Upon a match, store details in
+   *KWSMATCH: index of matched keyword, start offset (same as the return
+   value), and length.  */
+size_t
+kwsexec (kwset_t kwset, char const *text, size_t size,
+         struct kwsmatch *kwsmatch, bool longest)
+{
+  return kwset->kwsexec (kwset, text, size, kwsmatch, longest);
+}
+
+/* Free the components of the given keyword set. */
+void
+kwsfree (kwset_t kwset)
+{
+  obstack_free (&kwset->obstack, NULL);
+  free (kwset);
+}
+/* pcresearch.c - searching subroutines using PCRE for grep.
+   Copyright 2000, 2007, 2009-2016 Free Software Foundation, Inc.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 3, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA
+   02110-1301, USA.  */
+
+/* Written August 1992 by Mike Haertel. */
+
+#include <config.h>
+#include "search.h"
+#include "verify.h"
+
+/* Wrap a fatal 3-argument use of "error" (with literal nonzero exit
+   status), so that static analyzers like clang-analyzer and GCC 7's
+   -Wimplicit-fallthrough know this "function" does not return.  */
+#define die(st, fmt, arg)						\
+  do									\
+    {									\
+      verify ((st) != 0);						\
+      error (0, fmt, arg);						\
+      exit (st);							\
+    }									\
+  while (0)
+
+#if HAVE_LIBPCRE
+# include <pcre.h>
+
+/* This must be at least 2; everything after that is for performance
+   in pcre_exec.  */
+enum { NSUB = 300 };
+
+/* Compiled internal form of a Perl regular expression.  */
+static pcre *cre;
+
+/* Additional information about the pattern.  */
+static pcre_extra *extra;
+
+# ifndef PCRE_STUDY_JIT_COMPILE
+#  define PCRE_STUDY_JIT_COMPILE 0
+# endif
+
+# if PCRE_STUDY_JIT_COMPILE
+/* Maximum size of the JIT stack.  */
+static int jit_stack_size;
+# endif
+
+/* Match the already-compiled PCRE pattern against the data in SUBJECT,
+   of size SEARCH_BYTES and starting with offset SEARCH_OFFSET, with
+   options OPTIONS, and storing resulting matches into SUB.  Return
+   the (nonnegative) match location or a (negative) error number.  */
+static int
+jit_exec (char const *subject, int search_bytes, int search_offset,
+          int options, int *sub)
+{
+  while (true)
+    {
+      int e = pcre_exec (cre, extra, subject, search_bytes, search_offset,
+                         options, sub, NSUB);
+
+# if PCRE_STUDY_JIT_COMPILE
+      if (e == PCRE_ERROR_JIT_STACKLIMIT
+          && 0 < jit_stack_size && jit_stack_size <= INT_MAX / 2)
+        {
+          int old_size = jit_stack_size;
+          int new_size = jit_stack_size = old_size * 2;
+          static pcre_jit_stack *jit_stack;
+          if (jit_stack)
+            pcre_jit_stack_free (jit_stack);
+          jit_stack = pcre_jit_stack_alloc (old_size, new_size);
+          if (!jit_stack)
+            error (EXIT_TROUBLE, 0,
+                   _("failed to allocate memory for the PCRE JIT stack"));
+          pcre_assign_jit_stack (extra, NULL, jit_stack);
+          continue;
+        }
+# endif
+
+      return e;
+    }
+}
+
+#endif
+
+#if HAVE_LIBPCRE
+/* Table, indexed by ! (flag & PCRE_NOTBOL), of whether the empty
+   string matches when that flag is used.  */
+static int empty_match[2];
+
+static bool multibyte_locale;
+#endif
+
+void
+Pcompile (char const *pattern, size_t size)
+{
+#if !HAVE_LIBPCRE
+  error (EXIT_TROUBLE, 0, "%s",
+         _("support for the -P option is not compiled into "
+           "this --disable-perl-regexp binary"));
+#else
+  int e;
+  char const *ep;
+  static char const wprefix[] = "(?<!\\w)(?:";
+  static char const wsuffix[] = ")(?!\\w)";
+  static char const xprefix[] = "^(?:";
+  static char const xsuffix[] = ")$";
+  int fix_len_max = MAX (sizeof wprefix - 1 + sizeof wsuffix - 1,
+                         sizeof xprefix - 1 + sizeof xsuffix - 1);
+  char *re = xnmalloc (4, size + (fix_len_max + 4 - 1) / 4);
+  int flags = (PCRE_MULTILINE
+               | (match_icase ? PCRE_CASELESS : 0));
+  char const *patlim = pattern + size;
+  char *n = re;
+  char const *p;
+  char const *pnul;
+
+  if (1 < MB_CUR_MAX)
+    {
+      if (! localeinfo.using_utf8)
+        error (EXIT_TROUBLE, 0,
+               _("-P supports only unibyte and UTF-8 locales"));
+      multibyte_locale = true;
+      flags |= PCRE_UTF8;
+    }
+
+  /* FIXME: Remove these restrictions.  */
+  if (memchr (pattern, '\n', size))
+    error (EXIT_TROUBLE, 0, _("the -P option only supports a single pattern"));
+  if (! eolbyte)
+    {
+      bool escaped = false;
+      bool after_unescaped_left_bracket = false;
+      for (p = pattern; *p; p++)
+        if (escaped)
+          escaped = after_unescaped_left_bracket = false;
+        else
+          {
+            if (*p == '$' || (*p == '^' && !after_unescaped_left_bracket))
+              error (EXIT_TROUBLE, 0,
+                     _("unescaped ^ or $ not supported with -Pz"));
+            escaped = *p == '\\';
+            after_unescaped_left_bracket = *p == '[';
+          }
+    }
+
+  *n = '\0';
+  if (match_words)
+    strcpy (n, wprefix);
+  if (match_lines)
+    strcpy (n, xprefix);
+  n += strlen (n);
+
+  /* The PCRE interface doesn't allow NUL bytes in the pattern, so
+     replace each NUL byte in the pattern with the four characters
+     "\000", removing a preceding backslash if there are an odd
+     number of backslashes before the NUL.  */
+  for (p = pattern; (pnul = memchr (p, '\0', patlim - p)); p = pnul + 1)
+    {
+      memcpy (n, p, pnul - p);
+      n += pnul - p;
+      for (p = pnul; pattern < p && p[-1] == '\\'; p--)
+        continue;
+      n -= (pnul - p) & 1;
+      strcpy (n, "\\000");
+      n += 4;
+    }
+
+  memcpy (n, p, patlim - p);
+  n += patlim - p;
+  *n = '\0';
+  if (match_words)
+    strcpy (n, wsuffix);
+  if (match_lines)
+    strcpy (n, xsuffix);
+
+  cre = pcre_compile (re, flags, &ep, &e, pcre_maketables ());
+  if (!cre)
+    error (EXIT_TROUBLE, 0, "%s", ep);
+
+  extra = pcre_study (cre, PCRE_STUDY_JIT_COMPILE, &ep);
+  if (ep)
+    error (EXIT_TROUBLE, 0, "%s", ep);
+
+# if PCRE_STUDY_JIT_COMPILE
+  if (pcre_fullinfo (cre, extra, PCRE_INFO_JIT, &e))
+    error (EXIT_TROUBLE, 0, _("internal error (should never happen)"));
+
+  /* The PCRE documentation says that a 32 KiB stack is the default.  */
+  if (e)
+    jit_stack_size = 32 << 10;
+# endif
+
+  free (re);
+
+  int sub[NSUB];
+  empty_match[false] = pcre_exec (cre, extra, "", 0, 0,
+                                  PCRE_NOTBOL, sub, NSUB);
+  empty_match[true] = pcre_exec (cre, extra, "", 0, 0, 0, sub, NSUB);
+#endif /* HAVE_LIBPCRE */
+}
+
+size_t
+Pexecute (char *buf, size_t size, size_t *match_size,
+          char const *start_ptr)
+{
+#if !HAVE_LIBPCRE
+  /* We can't get here, because Pcompile would have been called earlier.  */
+  error (EXIT_TROUBLE, 0, _("internal error"));
+  return -1;
+#else
+  int sub[NSUB];
+  char const *p = start_ptr ? start_ptr : buf;
+  bool bol = p[-1] == eolbyte;
+  char const *line_start = buf;
+  int e = PCRE_ERROR_NOMATCH;
+  char const *line_end;
+
+  /* The search address to pass to pcre_exec.  This is the start of
+     the buffer, or just past the most-recently discovered encoding
+     error.  */
+  char const *subject = buf;
+
+  /* If the input is unibyte or is free of encoding errors a multiline search is
+     typically more efficient.  Otherwise, a single-line search is
+     typically faster, so that pcre_exec doesn't waste time validating
+     the entire input buffer.  */
+  bool multiline = true;
+  if (multibyte_locale)
+    {
+      multiline = ! buf_has_encoding_errors (buf, size - 1);
+      buf[size - 1] = eolbyte;
+    }
+
+  for (; p < buf + size; p = line_start = line_end + 1)
+    {
+      bool too_big;
+
+      if (multiline)
+        {
+          size_t pcre_size_max = MIN (INT_MAX, SIZE_MAX - 1);
+          size_t scan_size = MIN (pcre_size_max + 1, buf + size - p);
+          line_end = memrchr (p, eolbyte, scan_size);
+          too_big = ! line_end;
+        }
+      else
+        {
+          line_end = memchr (p, eolbyte, buf + size - p);
+          too_big = INT_MAX < line_end - p;
+        }
+
+      if (too_big)
+        error (EXIT_TROUBLE, 0, _("exceeded PCRE's line length limit"));
+
+      for (;;)
+        {
+          /* Skip past bytes that are easily determined to be encoding
+             errors, treating them as data that cannot match.  This is
+             faster than having pcre_exec check them.  */
+          while (localeinfo.sbclen[to_uchar (*p)] == -1)
+            {
+              p++;
+              subject = p;
+              bol = false;
+            }
+
+          int search_offset = p - subject;
+
+          /* Check for an empty match; this is faster than letting
+             pcre_exec do it.  */
+          if (p == line_end)
+            {
+              sub[0] = sub[1] = search_offset;
+              e = empty_match[bol];
+              break;
+            }
+
+          int options = 0;
+          if (!bol)
+            options |= PCRE_NOTBOL;
+          if (multiline)
+            options |= PCRE_NO_UTF8_CHECK;
+
+          e = jit_exec (subject, line_end - subject, search_offset,
+                        options, sub);
+          if (e != PCRE_ERROR_BADUTF8)
+            {
+              if (0 < e && multiline && sub[1] - sub[0] != 0)
+                {
+                  char const *nl = memchr (subject + sub[0], eolbyte,
+                                           sub[1] - sub[0]);
+                  if (nl)
+                    {
+                      /* This match crosses a line boundary; reject it.  */
+                      p = subject + sub[0];
+                      line_end = nl;
+                      continue;
+                    }
+                }
+              break;
+            }
+          int valid_bytes = sub[0];
+
+          if (search_offset <= valid_bytes)
+            {
+              /* Try to match the string before the encoding error.  */
+              if (valid_bytes == 0)
+                {
+                  /* Handle the empty-match case specially, for speed.
+                     This optimization is valid if VALID_BYTES is zero,
+                     which means SEARCH_OFFSET is also zero.  */
+                  sub[1] = 0;
+                  e = empty_match[bol];
+                }
+              else
+                e = jit_exec (subject, valid_bytes, search_offset,
+                              options | PCRE_NO_UTF8_CHECK | PCRE_NOTEOL, sub);
+
+              if (e != PCRE_ERROR_NOMATCH)
+                break;
+
+              /* Treat the encoding error as data that cannot match.  */
+              p = subject + valid_bytes + 1;
+              bol = false;
+            }
+
+          subject += valid_bytes + 1;
+        }
+
+      if (e != PCRE_ERROR_NOMATCH)
+        break;
+      bol = true;
+    }
+
+  if (e <= 0)
+    {
+      switch (e)
+        {
+        case PCRE_ERROR_NOMATCH:
+          break;
+
+        case PCRE_ERROR_NOMEMORY:
+          die (EXIT_TROUBLE, 0, _("memory exhausted"));
+
+# if PCRE_STUDY_JIT_COMPILE
+        case PCRE_ERROR_JIT_STACKLIMIT:
+          die (EXIT_TROUBLE, 0, _("exhausted PCRE JIT stack"));
+# endif
+
+        case PCRE_ERROR_MATCHLIMIT:
+          die (EXIT_TROUBLE, 0, _("exceeded PCRE's backtracking limit"));
+
+        default:
+          /* For now, we lump all remaining PCRE failures into this basket.
+             If anyone cares to provide sample grep usage that can trigger
+             particular PCRE errors, we can add to the list (above) of more
+             detailed diagnostics.  */
+          error (EXIT_TROUBLE, 0, _("internal PCRE error: %d"), e);
+        }
+
+      return -1;
+    }
+  else
+    {
+      char const *matchbeg = subject + sub[0];
+      char const *matchend = subject + sub[1];
+      char const *beg;
+      char const *end;
+      if (start_ptr)
+        {
+          beg = matchbeg;
+          end = matchend;
+        }
+      else if (multiline)
+        {
+          char const *prev_nl = memrchr (line_start - 1, eolbyte,
+                                         matchbeg - (line_start - 1));
+          char const *next_nl = memchr (matchend, eolbyte,
+                                        line_end + 1 - matchend);
+          beg = prev_nl + 1;
+          end = next_nl + 1;
+        }
+      else
+        {
+          beg = line_start;
+          end = line_end + 1;
+        }
+      *match_size = end - beg;
+      return beg - buf;
+    }
+#endif
+}
+/* searchutils.c - helper subroutines for grep's matchers.
+   Copyright 1992, 1998, 2000, 2007, 2009-2016 Free Software Foundation, Inc.
+
+   This program is free software; you can redistribute it and/or modify
+   it under the terms of the GNU General Public License as published by
+   the Free Software Foundation; either version 3, or (at your option)
+   any later version.
+
+   This program is distributed in the hope that it will be useful,
+   but WITHOUT ANY WARRANTY; without even the implied warranty of
+   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+   GNU General Public License for more details.
+
+   You should have received a copy of the GNU General Public License
+   along with this program; if not, write to the Free Software
+   Foundation, Inc., 51 Franklin Street - Fifth Floor, Boston, MA
+   02110-1301, USA.  */
+
+#include <config.h>
+
+#define SEARCH_INLINE _GL_EXTERN_INLINE
+#define SYSTEM_INLINE _GL_EXTERN_INLINE
+#include "search.h"
+
+#define NCHAR (UCHAR_MAX + 1)
+
+kwset_t
+kwsinit (bool mb_trans)
+{
+  static char trans[NCHAR];
+  char *transptr = NULL;
+
+  if (match_icase && (MB_CUR_MAX == 1 || mb_trans))
+    {
+      if (MB_CUR_MAX == 1)
+        for (int i = 0; i < NCHAR; i++)
+          trans[i] = toupper (i);
+      else
+        for (int i = 0; i < NCHAR; i++)
+          {
+            wint_t wc = localeinfo.sbctowc[i];
+            wint_t uwc = towupper (wc);
+            if (uwc != wc)
+              {
+                mbstate_t mbs = { 0 };
+                size_t len = wcrtomb (&trans[i], uwc, &mbs);
+                if (len != 1)
+                  abort ();
+              }
+            else
+              trans[i] = i;
+          }
+      transptr = trans;
+    }
+
+  return kwsalloc (transptr, false);
+}
+
+/* In the buffer *MB_START, return the number of bytes needed to go
+   back from CUR to the previous boundary, where a "boundary" is the
+   start of a multibyte character or is an error-encoding byte.  The
+   buffer ends at END (i.e., one past the address of the buffer's last
+   byte).  If CUR is already at a boundary, return 0.  If *MB_START is
+   greater than or equal to CUR, return the negative value CUR - *MB_START.
+
+   When returning zero, set *MB_START to CUR.  When returning a
+   positive value, set *MB_START to the next boundary after CUR, or to
+   END if there is no such boundary.  When returning a negative value,
+   leave *MB_START alone.  */
+ptrdiff_t
+mb_goback (char const **mb_start, char const *cur, char const *end)
+{
+  const char *p = *mb_start;
+  const char *p0 = p;
+  mbstate_t cur_state;
+
+  memset (&cur_state, 0, sizeof cur_state);
+
+  while (p < cur)
+    {
+      size_t clen = mb_clen (p, end - p, &cur_state);
+
+      if ((size_t) -2 <= clen)
+        {
+          /* An invalid sequence, or a truncated multibyte character.
+             Treat it as a single byte character.  */
+          clen = 1;
+          memset (&cur_state, 0, sizeof cur_state);
+        }
+      p0 = p;
+      p += clen;
+    }
+
+  *mb_start = p;
+  return p == cur ? 0 : cur - p0;
+}
+
+/* In the buffer BUF, return the wide character that is encoded just
+   before CUR.  The buffer ends at END.  Return WEOF if there is no
+   wide character just before CUR.  */
+wint_t
+mb_prev_wc (char const *buf, char const *cur, char const *end)
+{
+  if (cur == buf)
+    return WEOF;
+  char const *p = buf;
+  cur--;
+  cur -= mb_goback (&p, cur, end);
+  return mb_next_wc (cur, end);
+}
+
+/* Return the wide character that is encoded at CUR.  The buffer ends
+   at END.  Return WEOF if there is no wide character encoded at CUR.  */
+wint_t
+mb_next_wc (char const *cur, char const *end)
+{
+  wchar_t wc;
+  mbstate_t mbs = { 0 };
+  return (end - cur != 0 && mbrtowc (&wc, cur, end - cur, &mbs) < (size_t) -2
+          ? wc : WEOF);
+}
