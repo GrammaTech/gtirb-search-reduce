@@ -30,7 +30,9 @@ class DDBlocks(DD):
         self._ir = self._ir_loader.IRLoadFromProtobufFileName(self.infile)
         self._factory = self._ir_loader._factory
 
-    def _test(self, delete_blocks):
+    def _test(self, blocks):
+        blocks = set(blocks)
+        delete_blocks = [x for x in self.blocklist if x not in blocks]
         logging.debug(f"Processing: \n"
                       f"{' '.join([str(b) for b in delete_blocks])}")
         self.test_count += 1
@@ -47,7 +49,7 @@ class DDBlocks(DD):
              tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
                                          suffix='.S') as asm, \
              tempfile.NamedTemporaryFile(prefix=str(self.test_count) + '-',
-                                         suffix='.exe') as exe:
+                                         suffix='.exe', delete=False) as exe:
             ir_file.write(self._ir.toProtobuf().SerializeToString())
             ir_file.flush()
             # Dump assembly
@@ -63,11 +65,11 @@ class DDBlocks(DD):
                     logging.error("gtirb-pprinter failed to assemble "
                                   f"{asm.name}")
                     logging.info("FAIL")
-                    return Result.FAIL
+                    return Result.PASS
             except Exception:
                 logging.error("Exception while running gtirb-pprinter")
                 logging.info("FAIL")
-                return Result.FAIL
+                return Result.PASS
 
             # Compile
             logging.info("Compiling")
@@ -79,16 +81,16 @@ class DDBlocks(DD):
                 if result.returncode != 0:
                     logging.error(f"gcc failed to build {exe.name}")
                     logging.info("FAIL")
-                    return Result.FAIL
+                    return Result.PASS
             except Exception:
                 logging.error("exception while running gcc")
                 logging.info("FAIL")
-                return Result.FAIL
+                return Result.PASS
             # Run tests
             logging.info("Testing")
             # FIXME
             logging.info("PASS")
-            return Result.PASS
+            return Result.FAIL
 
 
 def main():
@@ -129,8 +131,9 @@ def main():
                             datefmt=datefmt)
 
     dd = DDBlocks(args.input, args.trampoline)
-    blocks = dd.ddmax(dd.blocklist)
+    blocks = set(dd.ddmin(dd.blocklist))
 
+    print([x for x in dd.blocklist if x not in blocks])
     ir_out = ir.toProtobuf()
     with open(args.out, 'wb') as outfile:
         outfile.write(ir_out.SerializeToString())
