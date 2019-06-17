@@ -33,9 +33,10 @@ class DDBlocks(DD):
     def _test(self, blocks):
         blocks = set(blocks)
         delete_blocks = [x for x in self.blocklist if x not in blocks]
+        self.test_count += 1
+        logging.info(f"Test #{self.test_count}")
         logging.debug(f"Processing: \n"
                       f"{' '.join([str(b) for b in delete_blocks])}")
-        self.test_count += 1
         # Re-read IR every time
         logging.info("Reading IR")
         self._read_ir()
@@ -121,7 +122,7 @@ def main():
     if not os.path.exists(args.trampoline):
         sys.exit(f"Error: Trampoline file {args.trampoline} does not exist")
 
-    format = '[%(levelname)-8s %(asctime)s] - %(module)s: %(message)s'
+    format = '[%(levelname)-5s %(asctime)s] - %(module)s: %(message)s'
     datefmt = '%m/%d %H:%M:%S'
     if args.log_file:
         logging.basicConfig(filename=args.log_file, format=format,

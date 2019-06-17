@@ -121,27 +121,31 @@ def remove_blocks(ir, factory, block_addresses=list()):
         logging.debug("Pointing stale references to trampoline")
         for op in module._symbolic_operands.values():
             try:
-                if op.symbol().referent() in blocks_removed:
+                if (isinstance(op, SymAddrConst)
+                    and op.symbol().referent() in blocks_removed):
                     op.setSymbol(extern_trampoline)
+                elif (isinstance(op, SymAddrAddr)
+                      and op._symbol1.referent() in blocks_removed):
+                    op.setSymbol1(extern_trampoline)
             except Exception:
                 pass
-
         logging.debug("Deleting blocks from GTIRB")
         module.removeBlocks(blocks_removed)
         logging.debug("Deleting edges from GTIRB CFG")
         cfg.removeEdges(edges_removed)
+        logging.debug("Deleting functionBlock info from AuxData")
         function_blocks = module.auxData('functionBlocks')
         for value in function_blocks.values():
             for block in blocks_removed:
                 value.discard(block._uuid)
-
+        logging.debug("Deleting functionEntries info from AuxData")
         function_entries = module.auxData('functionEntries')
-        keys_to_delete = list()
+        keys_to_delete = set()
         for key, value in function_entries.items():
             for block in blocks_removed:
                 value.discard(block._uuid)
             if len(value) == 0:
-                keys_to_delete.append(key)
+                keys_to_delete.add(key)
 
         for key in keys_to_delete:
             del function_entries[key]
