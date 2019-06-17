@@ -143,9 +143,16 @@ def main():
 
     dd = DDBlocks(args.input, args.trampoline)
     blocks = set(dd.ddmin(dd.blocklist))
+    deleted_blocks = [b for b in dd.blocklist if b not in blocks]
 
-    print([x for x in dd.blocklist if x not in blocks])
+    ir_loader = IRLoader()
+    ir = ir_loader.IRLoadFromProtobufFileName(args.input)
+    factory = ir_loader._factory
+    block_deleter.remove_blocks(ir, factory, block_addresses=deleted_blocks)
     ir_out = ir.toProtobuf()
+
+    logging.info(f"Blocks to delete:\n"
+                 f"{' '.join([str(b) for b in deleted_blocks])}")
     with open(args.out, 'wb') as outfile:
         outfile.write(ir_out.SerializeToString())
 
