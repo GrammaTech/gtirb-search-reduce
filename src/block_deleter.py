@@ -119,16 +119,21 @@ def remove_blocks(ir, factory, block_addresses=list()):
         # Remove symbol references to the block addresses and replace them with
         # a call to the trampoline symbol
         logging.debug("Pointing stale references to trampoline")
-        for op in module._symbolic_operands.values():
+        keys_to_delete = set()
+        for key, op in module._symbolic_operands.items():
             try:
-                if (isinstance(op, SymAddrConst)
-                    and op.symbol().referent() in blocks_removed):
+                if (isinstance(op, SymAddrConst) and
+                    op.symbol().referent() in blocks_removed):
                     op.setSymbol(extern_trampoline)
-                elif (isinstance(op, SymAddrAddr)
-                      and op._symbol1.referent() in blocks_removed):
-                    op.setSymbol1(extern_trampoline)
+                elif (isinstance(op, SymAddrAddr) and
+                      (op._symbol1.referent() in blocks_removed or
+                       op._symbol2.referent() in blocks_removed)):
+                    keys_to_delete.add(key)
             except Exception:
                 pass
+        for key in keys_to_delete:
+            del module._symbolic_operands[key]
+
         logging.debug("Deleting blocks from GTIRB")
         module.removeBlocks(blocks_removed)
         logging.debug("Deleting edges from GTIRB CFG")
