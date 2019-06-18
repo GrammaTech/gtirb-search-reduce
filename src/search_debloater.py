@@ -73,7 +73,7 @@ class DDBlocks(DD):
                     copy_dir(save_dir)
                 elif self.save_files == 'passing' and result == 'fail':
                     copy_dir(save_dir)
-                log.info(result)
+                log.info(result.upper())
                 return test_result
 
             asm = os.path.join(cur_dir, 'out.S')
@@ -167,11 +167,12 @@ def main():
 
     format = '[%(levelname)-5s %(asctime)s] - %(module)s: %(message)s'
     datefmt = '%m/%d %H:%M:%S'
+    log.basicConfig(level=args.log_level, format=format, datefmt=datefmt)
+
     if args.log_file:
-        log.basicConfig(filename=args.log_file, format=format,
-                        datefmt=datefmt, level=args.log_level)
-    else:
-        log.basicConfig(level=args.log_level, format=format, datefmt=datefmt)
+        fh = log.FileHandler(args.log_file)
+        fh.setFormatter(log.Formatter(format))
+        log.getLogger().addHandler(fh)
 
     dd = DDBlocks(infile=args.in_file,
                   trampoline=args.tramp,
