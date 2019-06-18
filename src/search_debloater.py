@@ -84,13 +84,13 @@ class DDBlocks(DD):
         log.info(f"Test #{self.test_count}")
         log.debug(f"Processing: \n{delete_blocks_list}")
 
-        # Re-read IR every time
-        log.info("Reading IR")
-        self._read_ir()
+        # Copy IR
+        log.info("Copying IR")
+        ir = copy.deepcopy(self._ir)
+
         # Generate new IR
         log.info("Deleting blocks")
-        block_deleter.remove_blocks(self._ir, self._factory,
-                                    block_addresses=delete_blocks)
+        block_deleter.remove_blocks(ir, self._factory, block_addresses=delete_blocks)
 
         # Output to a GTIRB file
         with tempfile.TemporaryDirectory(prefix=str(self.test_count) + '-',
@@ -123,7 +123,7 @@ class DDBlocks(DD):
             asm = os.path.join(cur_dir, 'out.S')
             exe = os.path.join(cur_dir, 'out.exe')
             block_list.write(delete_blocks_list.encode())
-            ir_file.write(self._ir.toProtobuf().SerializeToString())
+            ir_file.write(ir.toProtobuf().SerializeToString())
             ir_file.flush()
             # Dump assembly
             log.info("Dumping assembly")
