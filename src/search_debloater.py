@@ -14,25 +14,6 @@ import block_deleter
 from search.DD import DD, Result
 
 
-class PersistentTemporaryDirectory(tempfile.TemporaryDirectory):
-    """Uses tempfile's TemporaryDirectory, but adds the ability to save the
-    directory when used as a context manager."""
-
-    def __init__(self, suffix=None, prefix=None, dir=None, save_dir=None):
-        self.save_dir = save_dir
-        super().__init__(suffix, prefix, dir)
-
-    def __exit__(self, exc, value, tb):
-        if self.save_dir is not None:
-            try:
-                shutil.copytree(src=self.name, dst=self.save_dir)
-            except OSError as e:
-                log.error("Error copying "
-                          f"{self.name} to {self.save_dir}:\n"
-                          f"{e}")
-        super().__exit__(exc, value, tb)
-
-
 class DDBlocks(DD):
     def __init__(self, infile, trampoline, workdir, save_files):
         DD.__init__(self)
@@ -66,15 +47,35 @@ class DDBlocks(DD):
         log.info("Deleting blocks")
         block_deleter.remove_blocks(self._ir, self._factory,
                                     block_addresses=delete_blocks)
+
         # Output to a GTIRB file
-        save_dir = None
-        if self.save_files == 'all':
-            save_dir = os.path.join(self.workdir, str(self.test_count))
-        with PersistentTemporaryDirectory(prefix=str(self.test_count) + '-',
-                                          dir=self.workdir,
-                                          save_dir=save_dir) as cur_dir, \
+        with tempfile.TemporaryDirectory(prefix=str(self.test_count) + '-',
+                                         dir=self.workdir) as cur_dir, \
              open(os.path.join(cur_dir, 'blocks.txt'), 'w+b') as block_list, \
              open(os.path.join(cur_dir, 'out.ir'), 'w+b') as ir_file:
+
+            # Save if needed
+            def finish_test(test_result):
+                def copy_dir(dst):
+                    try:
+                        shutil.copytree(src=cur_dir, dst=dst)
+                    except OSError as e:
+                        log.error("Error copying "
+                                  f"{cur_dir} to {dst}:\n"
+                                  f"{e}")
+                result = { Result.FAIL : 'pass',
+                           Result.PASS : 'fail' }[test_result]
+                save_dir = os.path.join(self.workdir,
+                                        'results',
+                                        result,
+                                        str(self.test_count))
+                if self.save_files == 'all':
+                    copy_dir(save_dir)
+                elif self.save_files == 'passing' and result == 'fail':
+                    copy_dir(save_dir)
+                log.info(result)
+                return test_result
+
             asm = os.path.join(cur_dir, 'out.S')
             exe = os.path.join(cur_dir, 'out.exe')
             block_list.write(delete_blocks_list.encode())
@@ -91,12 +92,10 @@ class DDBlocks(DD):
                                         stderr=subprocess.DEVNULL)
                 if result.returncode != 0:
                     log.error(f"gtirb-pprinter failed to assemble {asm}")
-                    log.info("FAIL")
-                    return Result.PASS
+                    return finish_test(Result.PASS)
             except Exception:
                 log.error("Exception while running gtirb-pprinter")
-                log.info("FAIL")
-                return Result.PASS
+                return finish_test(Result.PASS)
 
             # Compile
             log.info("Compiling")
@@ -110,34 +109,22 @@ class DDBlocks(DD):
                 if res.returncode != 0:
                     log.info(f"gcc failed to build with error:\n"
                              f"{res.stderr.decode('utf-8').strip()}")
-                    log.info("FAIL")
-                    return Result.PASS
+                    return finish_test(Result.PASS)
             except Exception:
                 log.error("exception while running gcc")
-                log.info("FAIL")
-                return Result.PASS
+                return finish_test(Result.PASS)
 
             # Run tests
             log.info("Testing")
             test_command = ['tests/test.py', exe]
             result = subprocess.run(test_command)
             if result.returncode == 0:
-                log.info("PASS")
                 log.debug("Blocks deleted:\n"
                           f"{' '.join([str(b) for b in delete_blocks])}")
-                if self.save_files == 'passing':
-                    save_dir = os.path.join(self.workdir, str(self.test_count))
-                    try:
-                        shutil.copytree(src=cur_dir, dst=save_dir)
-                    except OSError as e:
-                        log.error("Error copying "
-                                  f"{self.name} to {self.save_dir}:\n"
-                                  f"{e}")
-                return Result.FAIL
+                return finish_test(Result.FAIL)
             else:
                 os.remove(exe)
-                log.info("FAIL")
-                return Result.PASS
+                return finish_test(Result.PASS)
 
 
 def main():
