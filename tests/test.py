@@ -20,7 +20,7 @@ def run_test(test_num, test_dir, input_file, limit):
     with open(output_path, 'rb') as output:
         original = output.read()
     if original is None:
-        print("Could not read original input for test {test_num}")
+        print(f"Could not read original input for test {test_num}")
 
     command = [limit_bin, str(limit),
                grep_bin, '-c', '-f', test_string, test_input]
