@@ -123,8 +123,8 @@ class DDBlocks(DD):
             result = subprocess.run(test_command)
             if result.returncode == 0:
                 log.info("PASS")
-                log.info("Blocks deleted:\n"
-                         f"{' '.join([str(b) for b in delete_blocks])}")
+                log.debug("Blocks deleted:\n"
+                          f"{' '.join([str(b) for b in delete_blocks])}")
                 if self.save_files == 'passing':
                     save_dir = os.path.join(self.workdir, str(self.test_count))
                     try:
