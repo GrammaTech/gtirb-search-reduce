@@ -22,15 +22,59 @@ class DDBlocks(DD):
         self.workdir = workdir
         self.save_files = save_files
         self._read_ir()
+        self.original_size = self._get_original_file_size()
+        if self.original_size is None:
+            sys.exit(f"Error: Could not build original file")
         self.blocklist = block_deleter.block_addresses(self._ir)
         self.test_count = 0
 
     def _read_ir(self):
         if not os.path.exists(self.infile):
-            sys.exit(f"Error: Input file {infile} does not exist.")
+            sys.exit(f"Error: Input file {self.infile} does not exist")
         self._ir_loader = IRLoader()
         self._ir = self._ir_loader.IRLoadFromProtobufFileName(self.infile)
         self._factory = self._ir_loader._factory
+
+    def _get_original_file_size(self):
+        log.info("Getting original file size")
+        with tempfile.NamedTemporaryFile(suffix='ir') as ir_file, \
+             tempfile.NamedTemporaryFile(suffix='.S') as asm, \
+             tempfile.NamedTemporaryFile(suffix='exe') as exe:
+            ir_file.write(self._ir.toProtobuf().SerializeToString())
+            ir_file.flush()
+            # Dump assembly
+            pprinter_command = ['gtirb-pprinter',
+                                '-i', ir_file.name,
+                                '-o', asm.name]
+            try:
+                res = subprocess.run(pprinter_command,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                if res.returncode != 0:
+                    log.error(f"gtirb-pprinter failed to assemble {asm}")
+                    return None
+            except Exception:
+                log.error("Exception while running gtirb-pprinter")
+                return None
+
+            # Compile
+            build_command = ['gcc', '-no-pie',
+                             asm.name, self.trampoline,
+                             '-o', exe.name]
+            try:
+                res = subprocess.run(build_command,
+                                     stdout=subprocess.PIPE,
+                                     stderr=subprocess.PIPE)
+                if res.returncode != 0:
+                    log.error(f"gcc failed to build with error:\n"
+                              f"{res.stderr.decode('utf-8').strip()}")
+                    return None
+            except Exception:
+                log.error("Exception while running gcc")
+                return None
+
+            # Get file size
+            return os.stat(exe.name).st_size
 
     def _test(self, blocks):
         blocks = set(blocks)
@@ -87,10 +131,10 @@ class DDBlocks(DD):
                                 '-i', ir_file.name,
                                 '-o', asm]
             try:
-                result = subprocess.run(pprinter_command,
-                                        stdout=subprocess.DEVNULL,
-                                        stderr=subprocess.DEVNULL)
-                if result.returncode != 0:
+                res = subprocess.run(pprinter_command,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
+                if res.returncode != 0:
                     log.error(f"gtirb-pprinter failed to assemble {asm}")
                     return finish_test(Result.PASS)
             except Exception:
@@ -117,14 +161,18 @@ class DDBlocks(DD):
             # Run tests
             log.info("Testing")
             test_command = ['tests/test.py', exe]
-            result = subprocess.run(test_command)
-            if result.returncode == 0:
+            res = subprocess.run(test_command)
+            if res.returncode != 0:
+                return finish_test(Result.PASS)
+            else:
                 log.debug("Blocks deleted:\n"
                           f"{' '.join([str(b) for b in delete_blocks])}")
-                return finish_test(Result.FAIL)
-            else:
-                os.remove(exe)
-                return finish_test(Result.PASS)
+                new_size = os.stat(exe).st_size
+                finish_test(Result.FAIL)
+                log.info(f"New file size: {new_size}, "
+                         f"{new_size / self.original_size * 100}% "
+                         "of original size")
+                return Result.FAIL
 
 
 def main():
