@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 
 import argparse
-import copy
 import logging as log
+import pickle
 import tempfile
 import shutil
 import subprocess
@@ -85,8 +85,12 @@ class DDBlocks(DD):
         log.debug(f"Processing: \n{delete_blocks_list}")
 
         # Copy IR
+
+        # I (Jeremy) profiled pickle.loads(pickle.dumps()) and copy.deepcopy()
+        # and found that the pickle/unpickle method is about 5x faster. I think
+        # this is because deepcopy() has a lot of bookkeeping for corner cases.
         log.info("Copying IR")
-        ir = copy.deepcopy(self._ir)
+        ir = pickle.loads(pickle.dumps(self._ir))
 
         # Generate new IR
         log.info("Deleting blocks")
