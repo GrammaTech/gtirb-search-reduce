@@ -76,7 +76,7 @@ class DDDeleter(DD):
     def _test(self, items):
         items = set(items)
         delete_items = [x for x in self.items if x not in items]
-        delete_items_list = ' '.join([str(b) for b in delete_items])
+        delete_items_list = ' '.join(sorted([str(b) for b in delete_items]))
         self.test_count += 1
         log.info(f"Test #{self.test_count}")
         log.debug(f"Processing: \n{delete_items_list}")
@@ -95,7 +95,7 @@ class DDDeleter(DD):
         # Output to a GTIRB file
         with tempfile.TemporaryDirectory(prefix=str(self.test_count) + '-',
                                          dir=self.workdir) as cur_dir, \
-             open(os.path.join(cur_dir, 'deleted.txt'), 'w+b') as item_list, \
+             open(os.path.join(cur_dir, 'deleted.txt'), 'w+') as item_list, \
              open(os.path.join(cur_dir, 'out.ir'), 'w+b') as ir_file:
 
             # Save if needed
@@ -110,7 +110,6 @@ class DDDeleter(DD):
                 result = {Result.FAIL: 'pass',
                           Result.PASS: 'fail'}[test_result]
                 save_dir = os.path.join(self.workdir,
-                                        'results',
                                         result,
                                         str(self.test_count))
                 if self.save_files == 'all':
@@ -122,7 +121,8 @@ class DDDeleter(DD):
 
             asm = os.path.join(cur_dir, 'out.S')
             exe = os.path.join(cur_dir, 'out.exe')
-            item_list.write(delete_items_list.encode())
+            item_list.write(delete_items_list + "\n")
+            item_list.flush()
             ir_file.write(ir.toProtobuf().SerializeToString())
             ir_file.flush()
             # Dump assembly
