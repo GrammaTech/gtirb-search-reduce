@@ -8,11 +8,15 @@ import os
 
 from gtirb import *
 
-import block_deleter
+import gtirbtools.block_deleter as block_deleter
+import gtirbtools.build_ir as build_ir
 from search.DD import DD, Result
 
 
 class DDDeleter(DD):
+    """Base class for delta debugging approaches.
+    Must override the _delete() method in a subclass"""
+
     def __init__(self, infile, trampoline, workdir, save_files):
         DD.__init__(self)
         self.infile = infile
@@ -34,44 +38,10 @@ class DDDeleter(DD):
 
     def _get_original_file_size(self):
         log.info("Getting original file size")
-        with tempfile.NamedTemporaryFile(suffix='ir') as ir_file, \
-             tempfile.NamedTemporaryFile(suffix='.S') as asm, \
-             tempfile.NamedTemporaryFile(suffix='exe') as exe:
-            ir_file.write(self._ir.toProtobuf().SerializeToString())
-            ir_file.flush()
-            # Dump assembly
-            pprinter_command = ['gtirb-pprinter',
-                                '-i', ir_file.name,
-                                '-o', asm.name]
-            try:
-                res = subprocess.run(pprinter_command,
-                                     stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
-                if res.returncode != 0:
-                    log.error(f"gtirb-pprinter failed to assemble {asm}")
-                    return None
-            except Exception:
-                log.error("Exception while running gtirb-pprinter")
-                return None
-
-            # Compile
-            build_command = ['gcc', '-no-pie',
-                             asm.name, self.trampoline,
-                             '-o', exe.name]
-            try:
-                res = subprocess.run(build_command,
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE)
-                if res.returncode != 0:
-                    log.error(f"gcc failed to build with error:\n"
-                              f"{res.stderr.decode('utf-8').strip()}")
-                    return None
-            except Exception:
-                log.error("Exception while running gcc")
-                return None
-
-            # Get file size
-            return os.stat(exe.name).st_size
+        with tempfile.TemporaryDirectory() as build_dir:
+            build_ir.build(self._ir, self.trampoline, build_dir)
+            exe = os.path.join(build_dir, 'out.exe')
+            return os.stat(exe).st_size
 
     def _test(self, items):
         items = set(items)
@@ -80,8 +50,6 @@ class DDDeleter(DD):
         self.test_count += 1
         log.info(f"Test #{self.test_count}")
         log.debug(f"Processing: \n{delete_items_list}")
-
-        # Copy IR
 
         # I (Jeremy) profiled pickle.loads(pickle.dumps()) and copy.deepcopy()
         # and found that the pickle/unpickle method is about 5x faster. I think
@@ -95,8 +63,7 @@ class DDDeleter(DD):
         # Output to a GTIRB file
         with tempfile.TemporaryDirectory(prefix=str(self.test_count) + '-',
                                          dir=self.workdir) as cur_dir, \
-             open(os.path.join(cur_dir, 'deleted.txt'), 'w+') as item_list, \
-             open(os.path.join(cur_dir, 'out.ir'), 'w+b') as ir_file:
+             open(os.path.join(cur_dir, 'deleted.txt'), 'w+') as item_list:
 
             # Save if needed
             def finish_test(test_result):
@@ -119,44 +86,15 @@ class DDDeleter(DD):
                 log.info(result.upper())
                 return test_result
 
-            asm = os.path.join(cur_dir, 'out.S')
-            exe = os.path.join(cur_dir, 'out.exe')
             item_list.write(delete_items_list + "\n")
             item_list.flush()
-            ir_file.write(ir.toProtobuf().SerializeToString())
-            ir_file.flush()
-            # Dump assembly
-            log.info("Dumping assembly")
-            pprinter_command = ['gtirb-pprinter',
-                                '-i', ir_file.name,
-                                '-o', asm]
-            try:
-                res = subprocess.run(pprinter_command,
-                                     stdout=subprocess.DEVNULL,
-                                     stderr=subprocess.DEVNULL)
-                if res.returncode != 0:
-                    log.error(f"gtirb-pprinter failed to assemble {asm}")
-                    return finish_test(Result.PASS)
-            except Exception:
-                log.error("Exception while running gtirb-pprinter")
-                return finish_test(Result.PASS)
 
-            # Compile
-            log.info("Compiling")
-            build_command = ['gcc', '-no-pie',
-                             asm, self.trampoline,
-                             '-o', exe]
             try:
-                res = subprocess.run(build_command,
-                                     stdout=subprocess.PIPE,
-                                     stderr=subprocess.PIPE)
-                if res.returncode != 0:
-                    log.info(f"gcc failed to build with error:\n"
-                             f"{res.stderr.decode('utf-8').strip()}")
-                    return finish_test(Result.PASS)
-            except Exception:
-                log.error("exception while running gcc")
+                build_ir.build(ir, self.trampoline, cur_dir)
+            except build_ir.BuildError as e:
+                log.info(e.message)
                 return finish_test(Result.PASS)
+            exe = os.path.join(cur_dir, 'out.exe')
 
             # Run tests
             log.info("Testing")
