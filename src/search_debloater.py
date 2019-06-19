@@ -9,7 +9,6 @@ import sys
 import os
 from gtirb import *
 
-import block_deleter
 from search.DDDeleter import DDBlocks, DDFunctions
 
 
@@ -60,23 +59,28 @@ def main():
         fh.setFormatter(log.Formatter(format))
         log.getLogger().addHandler(fh)
 
-    dd = DDBlocks(infile=args.in_file,
-                  trampoline=args.tramp,
-                  workdir=args.workdir,
-                  save_files=args.save)
-    blocks = set(dd.ddmin(dd.blocklist))
-    deleted_blocks = [b for b in dd.blocklist if b not in blocks]
+    # dd = DDBlocks(infile=args.in_file,
+    #               trampoline=args.tramp,
+    #               workdir=args.workdir,
+    #               save_files=args.save)
+    # blocks = set(dd.ddmin(dd.blocklist))
+    # deleted_blocks = [b for b in dd.blocklist if b not in blocks]
+    dd = DDFunctions(infile=args.in_file,
+                     trampoline=args.tramp,
+                     workdir=args.workdir,
+                     save_files=args.save)
+    functions = dd.ddmin(dd.functions)
 
-    ir_loader = IRLoader()
-    ir = ir_loader.IRLoadFromProtobufFileName(args.in_file)
-    factory = ir_loader._factory
-    block_deleter.remove_blocks(ir, factory, block_addresses=deleted_blocks)
-    ir_out = ir.toProtobuf()
+    # ir_loader = IRLoader()
+    # ir = ir_loader.IRLoadFromProtobufFileName(args.in_file)
+    # factory = ir_loader._factory
+    # block_deleter.remove_blocks(ir, factory, block_addresses=deleted_blocks)
+    # ir_out = ir.toProtobuf()
 
-    log.info(f"Blocks to delete:\n"
-             f"{' '.join([str(b) for b in deleted_blocks])}")
-    with open(args.out, 'wb') as outfile:
-        outfile.write(ir_out.SerializeToString())
+    log.info(f"Functions to delete:\n"
+             f"{' '.join(functions)}")
+    # with open(args.out, 'wb') as outfile:
+    #     outfile.write(ir_out.SerializeToString())
 
 
 if __name__ == '__main__':
