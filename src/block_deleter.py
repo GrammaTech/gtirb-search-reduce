@@ -1,7 +1,7 @@
 # Large parts copied from block_remove.py in the rewriting/gtirb-reduce repo
 
 import argparse
-import logging
+import logging as log
 import sys
 import os
 import pprint
@@ -70,7 +70,7 @@ def remove_blocks(ir, factory, block_addresses=list()):
                 blocks_by_addr[block._address] = block
 
         # Add CFG edges to graph
-        logging.debug("Building graph")
+        log.debug("Building graph")
         for edge in cfg._edges:
             add_edge(graph, edge.source(), edge.target(), edge)
 
@@ -78,19 +78,19 @@ def remove_blocks(ir, factory, block_addresses=list()):
         # `if x in` checks
         edges_removed = set()
         blocks_removed = set()
-        logging.debug("Removing blocks "
-                      f"{' '.join([f'{b:x}' for b in block_addresses])}")
+        log.debug("Removing blocks "
+                  f"{' '.join([f'{b:x}' for b in block_addresses])}")
 
         # Remove nodes from the graph, returned list of edges correspond to the
         # edges that must be deleted from the IR
         for b in block_addresses:
             if b not in blocks_by_addr:
-                logging.warning(f"No block with address {b:x} found")
+                log.warning(f"No block with address {b:x} found")
                 continue
             blocks_removed.add(blocks_by_addr[b])
             edges_removed.update(set(remove_node(graph, blocks_by_addr[b])))
 
-        # if logging.getLogger().isEnabledFor(logging.DEBUG):
+        # if log.getLogger().isEnabledFor(log.DEBUG):
         #     for edge_removed in edges_removed:
         #         source = edge_removed.source()
         #         s_addr = source._address
@@ -99,26 +99,26 @@ def remove_blocks(ir, factory, block_addresses=list()):
         #             continue
         #         t_addr = target._address
         #         if (target in blocks_removed and source not in blocks_removed):
-        #             logging.debug(f"{t_addr:x} removed,"
-        #                           f" but {s_addr:x} references it")
-        #         logging.debug(f"removed edge {s_addr:x} -> {t_addr:x}")
+        #             log.debug(f"{t_addr:x} removed,"
+        #                       f" but {s_addr:x} references it")
+        #         log.debug(f"removed edge {s_addr:x} -> {t_addr:x}")
 
         # Collects the symbols that refer to removed blocks so the symbols can
         # also be removed
-        logging.debug("Collecting symbols to remove")
+        log.debug("Collecting symbols to remove")
         symbols_to_remove = list()
         for symbol in module.symbols():
             block = symbol.referent()
             if isinstance(block, Block) and block in blocks_removed:
                 symbols_to_remove.append(symbol)
 
-        logging.debug("Removing symbols")
+        log.debug("Removing symbols")
         for symbol in symbols_to_remove:
             module._symbols.remove(symbol)
 
         # Remove symbol references to the block addresses and replace them with
         # a call to the trampoline symbol
-        logging.debug("Pointing stale references to trampoline")
+        log.debug("Pointing stale references to trampoline")
         keys_to_delete = set()
         for key, op in module._symbolic_operands.items():
             try:
@@ -134,21 +134,20 @@ def remove_blocks(ir, factory, block_addresses=list()):
         for key in keys_to_delete:
             del module._symbolic_operands[key]
 
-        logging.debug("Deleting blocks from GTIRB")
+        log.debug("Deleting blocks from GTIRB")
         module.removeBlocks(blocks_removed)
-        logging.debug("Deleting edges from GTIRB CFG")
+        log.debug("Deleting edges from GTIRB CFG")
         cfg.removeEdges(edges_removed)
-        logging.debug("Deleting functionBlock info from AuxData")
+        log.debug("Deleting functionBlock info from AuxData")
+        uuids = {b._uuid for b in blocks_removed}
         function_blocks = module.auxData('functionBlocks')
         for value in function_blocks.values():
-            for block in blocks_removed:
-                value.discard(block._uuid)
-        logging.debug("Deleting functionEntries info from AuxData")
+            value.difference_update(uuids)
+        log.debug("Deleting functionEntries info from AuxData")
         function_entries = module.auxData('functionEntries')
         keys_to_delete = set()
         for key, value in function_entries.items():
-            for block in blocks_removed:
-                value.discard(block._uuid)
+            value.difference_update(uuids)
             if len(value) == 0:
                 keys_to_delete.add(key)
 
