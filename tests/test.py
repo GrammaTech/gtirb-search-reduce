@@ -98,7 +98,7 @@ def main():
     for test_num in range(len(os.listdir(test_strings))):
         if run_test(test_num=test_num,
                     test_dir=test_dir,
-                    input_file="small",
+                    input_file="large",
                     limit=args.limit):
             passed += 1
         else:
