@@ -41,9 +41,13 @@ class DDDeleter(DD):
         with tempfile.TemporaryDirectory() as build_dir:
             build_ir.build(self._ir, self.trampoline, build_dir)
             exe = os.path.join(build_dir, 'out.exe')
-            return os.stat(exe).st_size
+            size = os.stat(exe).st_size
+            log.info(f"{size} bytes")
+            return size
 
     def _test(self, items):
+        """NOTE: Result.PASS and Result.FAIL have counterintuitive meanings here because
+        of the assumptions of Delta Debugging"""
         items = set(items)
         delete_items = [x for x in self.items if x not in items]
         delete_items_list = ' '.join(sorted([str(b) for b in delete_items]))
@@ -107,7 +111,7 @@ class DDDeleter(DD):
                           f"{delete_items_list}")
                 new_size = os.stat(exe).st_size
                 finish_test(Result.FAIL)
-                log.info(f"New file size: {new_size}, "
+                log.info(f"New file size: {new_size} bytes, "
                          f"{new_size / self.original_size * 100:.2f}% "
                          "of original size")
                 return Result.FAIL
