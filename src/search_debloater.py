@@ -3,6 +3,7 @@
 import argparse
 import logging as log
 import tempfile
+from datetime import datetime
 import shutil
 import subprocess
 import sys
@@ -71,6 +72,14 @@ def main():
                      save_files=args.save)
     functions = dd.ddmin(dd.functions)
 
+    start = datetime.now()
+    log.info(f"Start time: {start}")
+    linear = LinearBlocks(infile=args.in_file,
+                          trampoline=args.tramp,
+                          workdir=args.workdir,
+                          save_files=args.save)
+    functions = linear.run()
+
     # ir_loader = IRLoader()
     # ir = ir_loader.IRLoadFromProtobufFileName(args.in_file)
     # factory = ir_loader._factory
@@ -79,6 +88,11 @@ def main():
 
     log.info(f"Functions to delete:\n"
              f"{' '.join(functions)}")
+    finish = datetime.now()
+    runtime = finish - start
+    log.info(f"Finish time: {finish}")
+    log.info(f"Runtime: {runtime}")
+
     # with open(args.out, 'wb') as outfile:
     #     outfile.write(ir_out.SerializeToString())
 
