@@ -25,10 +25,10 @@ class Result(enum.Enum):
 
 
 class Test():
-    def __init__(self, binary, limit_bin, test_dir, limit=1):
+    def __init__(self, binary, limit_bin, tests_dir, limit=1):
         self.binary = binary
         self.limit_bin = limit_bin
-        self.test_dir = test_dir
+        self.tests_dir = tests_dir
         self.limit = str(limit)
         self.test_ids = None
         # Check limit binary
@@ -46,10 +46,10 @@ class Test():
             raise ReadError(f"Could not read file {path}")
         return contents
 
-    @staticmethod
-    def run_limited(command):
+    def run_limited(self, command, stdin=None):
         limit_command = [self.limit_bin, self.limit] + command
-        return sp.run(limit_command, stdout=sp.PIPE, stderr=sp.PIPE)
+        return sp.run(limit_command, stdin=stdin,
+                      stdout=sp.PIPE, stderr=sp.PIPE)
 
     def test_one(self, test_id):
         raise NotImplementedError
@@ -65,9 +65,12 @@ class Test():
         for test_id in tests_to_run:
             result = self.test_one(test_id)
             if result == Result.FAIL:
+                log.debug(f"{test_id}: FAIL")
                 failed += 1
                 if fail_early:
                     break
             else:
+                log.debug(f"{test_id}: OK")
                 passed += 1
+        log.debug(f"Passed: {passed}, Failed: {failed}")
         return (passed, failed)
