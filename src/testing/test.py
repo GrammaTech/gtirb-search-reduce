@@ -19,14 +19,19 @@ class LimitBinaryError(TestError):
         log.error("Could not run 'limit', have you compiled it?")
 
 
+class NoBinaryError(TestError):
+    def __init__(self):
+        log.error("No binary provided for testing")
+
+
 class Result(enum.Enum):
     PASS = "pass"
     FAIL = "fail"
 
 
 class Test():
-    def __init__(self, binary, limit_bin, tests_dir, limit=1):
-        self.binary = binary
+    def __init__(self, limit_bin, tests_dir, limit=1):
+        self.binary = None
         self.limit_bin = limit_bin
         self.tests_dir = tests_dir
         self.limit = str(limit)
@@ -56,6 +61,8 @@ class Test():
 
     def run_tests(self, max_tests=None, fail_early=True):
         """Runs tests. Returns a tuple of (num_passed, num_failed)"""
+        if self.binary is None:
+            raise NoBinaryError
         passed = 0
         failed = 0
         if max_tests is None:

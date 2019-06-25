@@ -11,14 +11,14 @@ class GrepTest(Test):
     Assumes the following layout for a test directory:
         test_dir/[flag]/[test_id]/{input,pattern,returncode,stderr,stdout}
     """
-    def __init__(self, binary, limit_bin, tests_dir, flag=None):
+    def __init__(self, limit_bin, tests_dir, flag=None):
         if flag is not None:
             tests_dir = os.path.join(tests_dir, flag)
             flag = '-' + flag
         else:
             tests_dir = os.path.join(tests_dir, 'vanilla')
         self.flag = flag
-        super().__init__(binary, limit_bin, tests_dir)
+        super().__init__(limit_bin, tests_dir)
         self.test_ids = self.get_tests_sorted()
 
     def get_tests_sorted(self):
