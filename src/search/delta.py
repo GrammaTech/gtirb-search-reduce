@@ -21,14 +21,14 @@ class Delta(DD.DD):
     """Base class for delta debugging approaches."""
 
     def __init__(self, save_files, tester, deleter):
-        super().__init__(self)
+        super().__init__()
         self.save_files = save_files
         self.tester = tester
         self.deleter = deleter
         self.test_count = 0
 
     def _test(self, items):
-        def finish_test(self, test_dir, test_result):
+        def finish_test(test_dir, test_result):
             """Saves the test directory depending on the result"""
             def copy_dir(dst):
                 try:
@@ -48,7 +48,7 @@ class Delta(DD.DD):
             return test_result
 
         items = set(self.deleter.items)
-        delete_items = [x for x in self.items if x not in items]
+        delete_items = [x for x in self.deleter.items if x not in items]
         delete_items_list = ' '.join(sorted([str(b) for b in delete_items]))
         self.test_count += 1
         log.info(f"Test #{self.test_count}")
@@ -60,7 +60,7 @@ class Delta(DD.DD):
         except IRGenerationError as e:
             return finish_test(e.dir_name, Result.FAIL)
 
-        exe = os.path.join(test_dir, 'out.exe')
+        exe = os.path.join(test_dir.name, 'out.exe')
         self.tester.binary = exe
 
         # Run tests
@@ -79,7 +79,7 @@ class Delta(DD.DD):
             return Result.PASS
 
     def run(self):
-        return self.ddmin(self.items)
+        return self.ddmin(self.deleter.items)
 
 
 class DeltaBlocks(Delta):

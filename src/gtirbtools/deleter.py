@@ -95,7 +95,7 @@ class FunctionDeleter(Deleter):
     def __init__(self, infile, trampoline, workdir):
         super().__init__(infile, trampoline, workdir)
         self.functions = info.get_function_map(self._ir).keys()
-        self.items = self.functions
+        self.items = list(self.functions)
 
     def _delete(self, ir, functions):
         log.info("Deleting functions")
