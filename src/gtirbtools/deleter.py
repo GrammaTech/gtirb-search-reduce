@@ -81,7 +81,6 @@ class Deleter():
         return cur_dir
 
 
-
 class BlockDeleter(Deleter):
     def __init__(self, infile, trampoline, workdir):
         super().__init__(infile, trampoline, workdir)

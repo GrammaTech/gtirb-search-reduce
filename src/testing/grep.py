@@ -47,7 +47,7 @@ class GrepTest(Test):
             result = self.run_limited(command, stdin=input_file)
 
         if (stdout, stderr, returncode) == \
-            (result.stdout, result.stderr, result.returncode):
+           (result.stdout, result.stderr, result.returncode):
             return Result.PASS
         else:
             return Result.FAIL

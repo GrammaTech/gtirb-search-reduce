@@ -87,19 +87,6 @@ def remove_blocks(ir, factory, block_addresses=list()):
             blocks_removed.add(blocks_by_addr[b])
             edges_removed.update(set(_remove_node(graph, blocks_by_addr[b])))
 
-        # if log.getLogger().isEnabledFor(log.DEBUG):
-        #     for edge_removed in edges_removed:
-        #         source = edge_removed.source()
-        #         s_addr = source._address
-        #         target = edge_removed.target()
-        #         if isinstance(target, ProxyBlock):
-        #             continue
-        #         t_addr = target._address
-        #         if (target in blocks_removed and source not in blocks_removed):
-        #             log.debug(f"{t_addr:x} removed,"
-        #                       f" but {s_addr:x} references it")
-        #         log.debug(f"removed edge {s_addr:x} -> {t_addr:x}")
-
         # Collects the symbols that refer to removed blocks so the symbols can
         # also be removed
         log.debug("Collecting symbols to remove")
@@ -120,7 +107,7 @@ def remove_blocks(ir, factory, block_addresses=list()):
         for key, op in module._symbolic_operands.items():
             try:
                 if (isinstance(op, SymAddrConst) and
-                    op.symbol().referent() in blocks_removed):
+                        op.symbol().referent() in blocks_removed):
                     op.setSymbol(extern_trampoline)
                 elif (isinstance(op, SymAddrAddr) and
                       (op._symbol1.referent() in blocks_removed or

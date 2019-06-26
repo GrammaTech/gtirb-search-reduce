@@ -60,4 +60,3 @@ def build(ir, trampoline, build_dir):
                                     f"{res.stderr.decode('utf-8').strip()}")
         except subprocess.SubprocessError:
             raise CompilerError("Exception while running gcc")
-

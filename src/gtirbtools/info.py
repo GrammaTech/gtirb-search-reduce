@@ -20,8 +20,8 @@ def get_function_map(ir):
         function_entries = module.auxData('functionEntries')
         # Symbol Name -> Block UUID
         block_symbols = {s.name(): s.referent().uuid()
-                          for s in module.symbols()
-                          if isinstance(s.referent(), Block)}
+                         for s in module.symbols()
+                         if isinstance(s.referent(), Block)}
         for symbol_name, block_uuid in block_symbols.items():
             for function_uuid, entry_block_uuids in function_entries.items():
                 if block_uuid in entry_block_uuids:

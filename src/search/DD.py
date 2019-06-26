@@ -426,7 +426,7 @@ class DD:
                     next_n = 2
                     cbar_offset = 0
                     log.debug(f"Reduce c2 to {len(next_c2)} deltas:\n"
-                                  f"{self.pretty(next_c2)}")
+                              f"{self.pretty(next_c2)}")
                     break
 
                 if t == Result.PASS and t2 == Result.FAIL:
