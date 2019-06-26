@@ -1,12 +1,13 @@
 from enum import Enum
 import logging as log
 import os
+import shutil
 
 from gtirb import *
 
 import search.DD as DD
 
-from gtirbtools.Deleter import BlockDeleter, FunctionDeleter, IRGenerationError
+from gtirbtools.deleter import BlockDeleter, FunctionDeleter, IRGenerationError
 
 
 class Result(Enum):
@@ -27,18 +28,16 @@ class Delta(DD.DD):
         self.test_count = 0
 
     def _test(self, items):
-        def finish_test(self, test_result, dir_name):
+        def finish_test(self, test_dir, test_result):
             """Saves the test directory depending on the result"""
             def copy_dir(dst):
                 try:
-                    shutil.copytree(src=cur_dir, dst=dst)
+                    shutil.copytree(src=test_dir, dst=dst)
                 except OSError as e:
-                    log.error("Error copying "
-                              f"{cur_dir} to {dst}:\n"
-                              f"{e}")
+                    log.error(f"Error copying {test_dir} to {dst}:\n{e}")
             result = {Result.PASS: 'pass',
                       Result.FAIL: 'fail'}[test_result]
-            save_dir = os.path.join(self.workdir,
+            save_dir = os.path.join(self.deleter.workdir,
                                     result,
                                     str(self.test_count))
             if self.save_files == 'all':
@@ -48,7 +47,7 @@ class Delta(DD.DD):
             log.info(result.upper())
             return test_result
 
-        items = set(items)
+        items = set(self.deleter.items)
         delete_items = [x for x in self.items if x not in items]
         delete_items_list = ' '.join(sorted([str(b) for b in delete_items]))
         self.test_count += 1
@@ -56,10 +55,10 @@ class Delta(DD.DD):
         log.debug(f"Processing: \n{delete_items_list}")
 
         try:
-            test_dir = \
-                deleter.delete(ir, delete_items, str(self.test_count) + '-')
+            test_dir = self.deleter.delete(delete_items,
+                                           str(self.test_count) + '-')
         except IRGenerationError as e:
-            return finish_test(Result.FAIL, e.dir_name)
+            return finish_test(e.dir_name, Result.FAIL)
 
         exe = os.path.join(test_dir, 'out.exe')
         self.tester.binary = exe
@@ -68,14 +67,14 @@ class Delta(DD.DD):
         log.info("Testing")
         passed, failed = self.tester.run_tests()
         if failed != 0:
-            return finish_test(Result.FAIL, test_dir)
+            return finish_test(test_dir.name, Result.FAIL)
         else:
             log.debug("Deleted:\n"
                       f"{delete_items_list}")
             new_size = os.stat(exe).st_size
-            finish_test(Result.PASS, test_dir)
+            finish_test(test_dir.name, Result.PASS)
             log.info(f"New file size: {new_size} bytes, "
-                     f"{new_size / self.original_size * 100:.2f}% "
+                     f"{new_size / self.deleter.original_size * 100:.2f}% "
                      "of original size")
             return Result.PASS
 

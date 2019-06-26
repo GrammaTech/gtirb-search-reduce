@@ -36,10 +36,11 @@ class Deleter():
             raise IRFileNotFound(infile)
         self.infile = infile
         self.trampoline = trampoline
-        self.save_files = save_files
+        self.workdir = workdir
         self._ir_loader = IRLoader()
         self._ir = self._ir_loader.IRLoadFromProtobufFileName(self.infile)
         self._factory = self._ir_loader._factory
+        self._original_size = None
 
     @property
     def original_size(self):
@@ -53,11 +54,11 @@ class Deleter():
             self._original_size = size
         return self._original_size
 
-    def _delete(self, ir, delete_items):
+    def _delete(self, ir, items):
         """Override in subclasses"""
         raise NotImplementedError
 
-    def delete(self, ir, delete_items, name):
+    def delete(self, items, name):
         # I (Jeremy) profiled pickle.loads(pickle.dumps()) and copy.deepcopy()
         # and found that the pickle/unpickle method is about 5x faster. I think
         # this is because deepcopy() has a lot of bookkeeping for corner cases.
@@ -65,16 +66,14 @@ class Deleter():
         ir = pickle.loads(pickle.dumps(self._ir))
 
         # Generate new IR
-        self._delete(ir, self._factory, items)
+        self._delete(ir, items)
 
         # Output to a GTIRB file
         cur_dir = tempfile.TemporaryDirectory(prefix=name, dir=self.workdir)
-        with open(os.path.join(cur_dir, 'deleted.txt'), 'w+') as item_list:
-            item_list.write(
-                ' '.join(sorted([str(i) for i in delete_items])) + "\n"
-            )
+        with open(os.path.join(cur_dir.name, 'deleted.txt'), 'w+') as listfile:
+            listfile.write(' '.join(sorted([str(i) for i in items])) + "\n")
         try:
-            build(ir, self.trampoline, cur_dir)
+            build(ir, self.trampoline, cur_dir.name)
         except BuildError as e:
             log.info(e.message)
             raise IRGenerationError(cur_dir)

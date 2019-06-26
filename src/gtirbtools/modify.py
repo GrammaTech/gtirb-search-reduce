@@ -4,6 +4,7 @@ import logging as log
 
 from gtirb import *
 
+from gtirbtools.info import get_function_map, get_function_block_addresses
 
 def _add_edge(graph, source, target, edge):
     source_entry = graph.get(source)
@@ -30,7 +31,7 @@ def _add_edge(graph, source, target, edge):
         }
 
 
-pdef _remove_node(graph, target_node):
+def _remove_node(graph, target_node):
     out_edges = list()
     connections = graph.get(target_node)
     if connections is None:
