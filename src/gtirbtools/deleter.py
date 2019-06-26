@@ -76,7 +76,7 @@ class Deleter():
             build(ir, self.trampoline, cur_dir.name)
         except BuildError as e:
             log.info(e.message)
-            raise IRGenerationError(cur_dir)
+            raise IRGenerationError(cur_dir.name)
         return cur_dir
 
 
