@@ -22,10 +22,6 @@ def main():
                         metavar="FILE",
                         dest='in_file',
                         required=True)
-    parser.add_argument("-o", "--out",
-                        help="output GTIRB file",
-                        metavar="FILE",
-                        default='out.ir')
     parser.add_argument("-t", "--tramp",
                         help="trampoline file",
                         metavar="FILE",
@@ -45,7 +41,8 @@ def main():
                         required=True)
     parser.add_argument("-s", "--save",
                         help="save files generated during the search",
-                        choices=['all', 'passing'])
+                        choices=['all', 'passing'],
+                        default='passing')
 
     args = parser.parse_args()
     if not os.path.exists(args.in_file):
