@@ -79,7 +79,15 @@ class Delta(DD.DD):
             return Result.PASS
 
     def run(self):
-        return self.ddmin(self.deleter.items)
+        self.start_time = datetime.now()
+        results = self.ddmin(self.deleter.items)
+        self.finish_time = datetime.now()
+        log.info(f"Items to delete:\n{' '.join(results)}")
+        runtime = self.finish_time - self.start_time
+        log.info(f"Runtime: {runtime}")
+        log.info("Building and testing final configuration")
+        self._test(results)
+        return results
 
 
 class DeltaBlocks(Delta):

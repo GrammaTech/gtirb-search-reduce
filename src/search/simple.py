@@ -1,3 +1,4 @@
+from datetime import datetime
 import logging as log
 import os
 import shutil
@@ -66,14 +67,29 @@ class Simple():
                      "of original size")
             return Result.PASS
 
-    def run(self):
+    def item_str(self, item):
+        return str(item)
+
+    def search(self):
         raise NotImplementedError
+
+    def run(self):
+        self.start_time = datetime.now()
+        results = self.search()
+        self.finish_time = datetime.now()
+        log.info(f"Items to delete:\n{' '.join(results)}")
+        runtime = self.finish_time - self.start_time
+        log.info(f"Runtime: {runtime}")
+        log.info("Building and testing final configuration")
+        self._test(results)
+        return results
 
 
 class Linear(Simple):
-    def run(self):
+    def search(self):
         to_delete = list()
         for item in self.deleter.items:
+            log.info(f"Trying {self.item_str(item)}")
             result = self._test(to_delete + [item])
             if result == Result.PASS:
                 to_delete.append(item)
@@ -81,8 +97,9 @@ class Linear(Simple):
 
 
 class LinearBlocks(Linear):
-    def __init__(self, infile, trampoline, workdir, save_files, tester):
-        deleter = BlockDeleter(infile, trampoline, workdir)
+    def item_str(self, block):
+        return f'0x{block:x}'
+
     def __init__(self, infile, trampoline, workdir,
                  save_files, tester, binary_name='out.exe'):
         deleter = BlockDeleter(infile, trampoline, workdir, binary_name)
@@ -97,18 +114,36 @@ class LinearFunctions(Linear):
 
 
 class Bisect(Simple):
-    def run(self):
+    def search(self):
         to_delete = self.deleter.items
 
         def search(items):
+            log.info(f"Trying {' '.join(self.item_str(x) for x in items)}")
             if items == []:
                 return items
             result = self._test(items)
             if result == Result.PASS:
                 return items
+            if len(items) == 1:
+                return []
             midpoint = len(items)//2
-            return search(items[:midpoint]) + search(items[midpoint:])
+            subset =  search(items[:midpoint]) + search(items[midpoint:])
+            if len(subset) > 1:
+                subset_str = ' '.join(self.item_str(x) for x in subset)
+                log.info(f"Trying combined results {subset_str}")
+                if self._test(subset) == Result.FAIL:
+                    log.error("Subset expected to pass {subset_str}")
+            return subset
         return search(to_delete)
+
+    def run(self):
+        self.start_time = datetime.now()
+        results = self.search()
+        self.finish_time = datetime.now()
+        log.info(f"Items to delete:\n{' '.join(results)}")
+        runtime = self.finish_time - self.start_time
+        log.info(f"Runtime: {runtime}")
+        return results
 
 
 class BisectBlocks(Bisect):
