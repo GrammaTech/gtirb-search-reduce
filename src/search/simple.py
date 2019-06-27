@@ -48,11 +48,11 @@ class Simple():
         except IRGenerationError as e:
             return finish_test(e.dir_name, Result.FAIL)
 
-        exe = os.path.join(test_dir.name, 'out.exe')
+        exe = os.path.join(test_dir.name, self.deleter.binary_name)
         self.tester.binary = exe
 
         # Run tests
-        log.info("Testing")
+        log.info("Starting tests")
         passed, failed = self.tester.run_tests()
         if failed != 0:
             return finish_test(test_dir.name, Result.FAIL)
@@ -83,12 +83,16 @@ class Linear(Simple):
 class LinearBlocks(Linear):
     def __init__(self, infile, trampoline, workdir, save_files, tester):
         deleter = BlockDeleter(infile, trampoline, workdir)
+    def __init__(self, infile, trampoline, workdir,
+                 save_files, tester, binary_name='out.exe'):
+        deleter = BlockDeleter(infile, trampoline, workdir, binary_name)
         super().__init__(save_files, tester, deleter)
 
 
 class LinearFunctions(Linear):
-    def __init__(self, infile, trampoline, workdir, save_files, tester):
-        deleter = FunctionDeleter(infile, trampoline, workdir)
+    def __init__(self, infile, trampoline, workdir,
+                 save_files, tester, binary_name='out.exe'):
+        deleter = FunctionDeleter(infile, trampoline, workdir, binary_name)
         super().__init__(save_files, tester, deleter)
 
 
@@ -108,12 +112,17 @@ class Bisect(Simple):
 
 
 class BisectBlocks(Bisect):
-    def __init__(self, infile, trampoline, workdir, save_files, tester):
-        deleter = BlockDeleter(infile, trampoline, workdir)
+    def item_str(self, block):
+        return f'0x{block:x}'
+
+    def __init__(self, infile, trampoline, workdir,
+                 save_files, tester, binary_name='out.exe'):
+        deleter = BlockDeleter(infile, trampoline, workdir, binary_name)
         super().__init__(save_files, tester, deleter)
 
 
 class BisectFunctions(Bisect):
-    def __init__(self, infile, trampoline, workdir, save_files, tester):
-        deleter = FunctionDeleter(infile, trampoline, workdir)
+    def __init__(self, infile, trampoline, workdir,
+                 save_files, tester, binary_name='out.exe'):
+        deleter = FunctionDeleter(infile, trampoline, workdir, binary_name)
         super().__init__(save_files, tester, deleter)

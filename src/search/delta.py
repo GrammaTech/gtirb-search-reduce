@@ -60,7 +60,7 @@ class Delta(DD.DD):
         except IRGenerationError as e:
             return finish_test(e.dir_name, Result.FAIL)
 
-        exe = os.path.join(test_dir.name, 'out.exe')
+        exe = os.path.join(test_dir.name, self.deleter.binary_name)
         self.tester.binary = exe
 
         # Run tests
@@ -83,12 +83,14 @@ class Delta(DD.DD):
 
 
 class DeltaBlocks(Delta):
-    def __init__(self, infile, trampoline, workdir, save_files, tester):
-        deleter = BlockDeleter(infile, trampoline, workdir)
+    def __init__(self, infile, trampoline, workdir,
+                 save_files, tester, binary_name='out.exe'):
+        deleter = BlockDeleter(infile, trampoline, workdir, binary_name)
         super().__init__(save_files, tester, deleter)
 
 
 class DeltaFunctions(Delta):
-    def __init__(self, infile, trampoline, workdir, save_files, tester):
-        deleter = FunctionDeleter(infile, trampoline, workdir)
+    def __init__(self, infile, trampoline, workdir,
+                 save_files, tester, binary_name='out.exe'):
+        deleter = FunctionDeleter(infile, trampoline, workdir, binary_name)
         super().__init__(save_files, tester, deleter)

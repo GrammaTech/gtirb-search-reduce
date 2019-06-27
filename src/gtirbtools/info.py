@@ -1,5 +1,3 @@
-import logging as log
-
 from gtirb import *
 
 
@@ -34,7 +32,6 @@ def get_function_block_addresses(function_name, functions, ir):
     """Returns the set of block addresses corresponding to the function
     with name function_name, given a mapping from function (symbol) names
     to function UUIDs"""
-    log.debug(f"Getting blocks for function {function_name}")
     function_uuid = functions[function_name]
     # Block UUID -> Block Address
     block_uuid_map = dict()

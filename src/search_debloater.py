@@ -3,7 +3,6 @@
 import argparse
 import logging as log
 import tempfile
-from datetime import datetime
 import shutil
 import subprocess
 import sys
@@ -66,20 +65,12 @@ def main():
     tester = GrepTest(limit_bin='/development/src/testing/limit',
                       tests_dir='/development/grep-generated-tests',
                       flag='c')
-    search = LinearFunctions(infile=args.in_file,
+    search = BisectFunctions(infile=args.in_file,
                              trampoline=args.tramp,
                              workdir=args.workdir,
                              save_files=args.save,
                              tester=tester)
-    start = datetime.now()
-    functions = search.run()
-    log.info(f"Functions to delete:\n"
-             f"{' '.join(functions)}")
-    finish = datetime.now()
-    runtime = finish - start
-    log.info(f"Finish time: {finish}")
-    log.info(f"Runtime: {runtime}")
-
+    results = search.run()
 
 if __name__ == '__main__':
     main()

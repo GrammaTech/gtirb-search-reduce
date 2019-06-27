@@ -23,11 +23,11 @@ class CompilerError(BuildError):
         self.message = message
 
 
-def build(ir, trampoline, build_dir):
+def build(ir, trampoline, build_dir, binary_name):
     """Creates out.{ir,S,exe} in build_dir"""
-    with open(os.path.join(build_dir, 'out.ir'), 'w+b') as ir_file:
-        asm = os.path.join(build_dir, 'out.S')
-        exe = os.path.join(build_dir, 'out.exe')
+    with open(os.path.join(build_dir, binary_name + '.ir'), 'w+b') as ir_file:
+        asm = os.path.join(build_dir, binary_name + '.S')
+        exe = os.path.join(build_dir, binary_name)
 
         log.info("Serializing IR")
         ir_file.write(ir.toProtobuf().SerializeToString())
