@@ -83,8 +83,7 @@ RUN cd /usr/local/src \
 
 # Build GTIRB
 RUN git clone https://git.grammatech.com/rewriting/gtirb.git /gtirb \
-    && cd /gtirb \
-    && git checkout PYTHON
+    && cd /gtirb
 RUN rm -rf /gtirb/build \
     /gtirb/CMakeCache.txt \
     /gtirb/CMakeFiles \
