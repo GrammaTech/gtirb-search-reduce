@@ -66,7 +66,7 @@ def main():
                               trampoline=args.tramp,
                               workdir=args.workdir,
                               binary_name='grep',
-                              build_flags = ['-lm', '-lresolv'])
+                              build_flags=['-lm', '-lresolv'])
     search = Bisect(save_files=args.save, tester=tester, deleter=deleter)
     results = search.run()
 

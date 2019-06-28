@@ -23,7 +23,7 @@ class CompilerError(BuildError):
         self.message = message
 
 
-def build(ir, trampoline, build_dir, binary_name):
+def build(ir, trampoline, build_dir, binary_name, build_flags):
     """Creates out.{ir,S,exe} in build_dir"""
     with open(os.path.join(build_dir, binary_name + '.ir'), 'w+b') as ir_file:
         asm = os.path.join(build_dir, binary_name + '.S')
@@ -49,8 +49,9 @@ def build(ir, trampoline, build_dir, binary_name):
 
         # Compile
         build_command = ['gcc', '-no-pie',
-                         asm, trampoline,
-                         '-o', exe]
+                         asm, trampoline]
+        build_command += build_flags
+        build_command += ['-o', exe]
         try:
             res = subprocess.run(build_command,
                                  stdout=subprocess.PIPE,

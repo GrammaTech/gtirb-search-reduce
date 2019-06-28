@@ -31,13 +31,15 @@ class IRGenerationError(DeleterError):
 
 class Deleter():
     """Base class for deletion of code in GTIRB"""
-    def __init__(self, infile, trampoline, workdir, binary_name):
+    def __init__(self, infile, trampoline, workdir,
+                 binary_name, build_flags=[]):
         if not os.path.exists(infile):
             raise IRFileNotFound(infile)
         self.infile = infile
         self.trampoline = trampoline
         self.workdir = workdir
         self.binary_name = binary_name
+        self.build_flags = build_flags
         self._ir_loader = IRLoader()
         self._ir = self._ir_loader.IRLoadFromProtobufFileName(self.infile)
         self._factory = self._ir_loader._factory
@@ -49,7 +51,8 @@ class Deleter():
             log.info("Calculating original file size")
             with tempfile.TemporaryDirectory() as build_dir:
                 exe = os.path.join(build_dir, self.binary_name)
-                build(self._ir, self.trampoline, build_dir, self.binary_name)
+                build(self._ir, self.trampoline, build_dir,
+                      self.binary_name, self.build_flags)
                 size = os.stat(exe).st_size
             log.info(f"{size} bytes")
             self._original_size = size
@@ -74,7 +77,8 @@ class Deleter():
         with open(os.path.join(cur_dir.name, 'deleted.txt'), 'w+') as listfile:
             listfile.write(' '.join(sorted([str(i) for i in items])) + "\n")
         try:
-            build(ir, self.trampoline, cur_dir.name, self.binary_name)
+            build(ir, self.trampoline, cur_dir.name,
+                  self.binary_name, self.build_flags)
         except BuildError as e:
             log.info(e.message)
             raise IRGenerationError(cur_dir.name)
@@ -82,8 +86,8 @@ class Deleter():
 
 
 class BlockDeleter(Deleter):
-    def __init__(self, infile, trampoline, workdir, binary_name):
-        super().__init__(infile, trampoline, workdir, binary_name)
+    def __init__(self, infile, trampoline, workdir, binary_name, build_flags):
+        super().__init__(infile, trampoline, workdir, binary_name, build_flags)
         self.blocks = info.block_addresses(self._ir)
         self.items = self.blocks
 
@@ -93,8 +97,8 @@ class BlockDeleter(Deleter):
 
 
 class FunctionDeleter(Deleter):
-    def __init__(self, infile, trampoline, workdir, binary_name):
-        super().__init__(infile, trampoline, workdir, binary_name)
+    def __init__(self, infile, trampoline, workdir, binary_name, build_flags):
+        super().__init__(infile, trampoline, workdir, binary_name, build_flags)
         self.functions = list(info.get_function_map(self._ir).keys())
         self.items = self.functions
 
