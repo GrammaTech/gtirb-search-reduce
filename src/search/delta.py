@@ -88,17 +88,3 @@ class Delta(DD.DD):
         log.info("Building and testing final configuration")
         self._test(results)
         return results
-
-
-class DeltaBlocks(Delta):
-    def __init__(self, infile, trampoline, workdir,
-                 save_files, tester, binary_name='out.exe'):
-        deleter = BlockDeleter(infile, trampoline, workdir, binary_name)
-        super().__init__(save_files, tester, deleter)
-
-
-class DeltaFunctions(Delta):
-    def __init__(self, infile, trampoline, workdir,
-                 save_files, tester, binary_name='out.exe'):
-        deleter = FunctionDeleter(infile, trampoline, workdir, binary_name)
-        super().__init__(save_files, tester, deleter)

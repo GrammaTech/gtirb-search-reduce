@@ -9,9 +9,9 @@ import sys
 import os
 from gtirb import *
 
-from search.delta import DeltaBlocks, DeltaFunctions
-from search.simple import BisectBlocks, BisectFunctions
-from search.simple import LinearBlocks, LinearFunctions
+from gtirbtools.deleter import BlockDeleter, FunctionDeleter
+from search.delta import Delta
+from search.simple import Bisect, Linear
 from testing.grep import GrepTest
 
 
@@ -62,11 +62,12 @@ def main():
     tester = GrepTest(limit_bin='/development/src/testing/limit',
                       tests_dir='/development/grep-generated-tests',
                       flag='c')
-    search = BisectFunctions(infile=args.in_file,
-                             trampoline=args.tramp,
-                             workdir=args.workdir,
-                             save_files=args.save,
-                             tester=tester)
+    deleter = FunctionDeleter(infile=args.in_file,
+                              trampoline=args.tramp,
+                              workdir=args.workdir,
+                              binary_name='grep',
+                              build_flags = ['-lm', '-lresolv'])
+    search = Bisect(save_files=args.save, tester=tester, deleter=deleter)
     results = search.run()
 
 if __name__ == '__main__':

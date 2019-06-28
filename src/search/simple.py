@@ -96,23 +96,6 @@ class Linear(Simple):
         return to_delete
 
 
-class LinearBlocks(Linear):
-    def item_str(self, block):
-        return f'0x{block:x}'
-
-    def __init__(self, infile, trampoline, workdir,
-                 save_files, tester, binary_name='out.exe'):
-        deleter = BlockDeleter(infile, trampoline, workdir, binary_name)
-        super().__init__(save_files, tester, deleter)
-
-
-class LinearFunctions(Linear):
-    def __init__(self, infile, trampoline, workdir,
-                 save_files, tester, binary_name='out.exe'):
-        deleter = FunctionDeleter(infile, trampoline, workdir, binary_name)
-        super().__init__(save_files, tester, deleter)
-
-
 class Bisect(Simple):
     def search(self):
         to_delete = self.deleter.items
@@ -145,20 +128,3 @@ class Bisect(Simple):
         runtime = self.finish_time - self.start_time
         log.info(f"Runtime: {runtime}")
         return results
-
-
-class BisectBlocks(Bisect):
-    def item_str(self, block):
-        return f'0x{block:x}'
-
-    def __init__(self, infile, trampoline, workdir,
-                 save_files, tester, binary_name='out.exe'):
-        deleter = BlockDeleter(infile, trampoline, workdir, binary_name)
-        super().__init__(save_files, tester, deleter)
-
-
-class BisectFunctions(Bisect):
-    def __init__(self, infile, trampoline, workdir,
-                 save_files, tester, binary_name='out.exe'):
-        deleter = FunctionDeleter(infile, trampoline, workdir, binary_name)
-        super().__init__(save_files, tester, deleter)
