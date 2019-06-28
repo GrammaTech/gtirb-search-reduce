@@ -132,7 +132,7 @@ class Bisect(Simple):
                 subset_str = ' '.join(self.item_str(x) for x in subset)
                 log.info(f"Trying combined results {subset_str}")
                 if self._test(subset) == Result.FAIL:
-                    log.error("Subset expected to pass {subset_str}")
+                    log.error(f"Subset expected to pass {subset_str}")
             return subset
         return search(to_delete)
 
@@ -140,7 +140,8 @@ class Bisect(Simple):
         self.start_time = datetime.now()
         results = self.search()
         self.finish_time = datetime.now()
-        log.info(f"Items to delete:\n{' '.join(results)}")
+        log.info("Items to delete:\n"
+                 f"{' '.join(self.item_str(x) for x in results)}")
         runtime = self.finish_time - self.start_time
         log.info(f"Runtime: {runtime}")
         return results

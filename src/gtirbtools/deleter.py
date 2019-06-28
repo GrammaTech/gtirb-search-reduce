@@ -46,7 +46,7 @@ class Deleter():
     @property
     def original_size(self):
         if self._original_size is None:
-            log.info("Getting original file size")
+            log.info("Calculating original file size")
             with tempfile.TemporaryDirectory() as build_dir:
                 exe = os.path.join(build_dir, self.binary_name)
                 build(self._ir, self.trampoline, build_dir, self.binary_name)
