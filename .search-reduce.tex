@@ -1,0 +1,65 @@
+%% Commands for little filled blocks (delta-debug and brute-force)
+\def\bffilldark(#1,#2,#3){
+  \foreach \x in {#2,...,#3}{
+    \node[draw,fill=gt@gray!30,below=\x em of #1] {};
+  }
+}
+\def\bffilllight(#1,#2,#3){
+  \foreach \x in {#2,...,#3}{
+    \node[draw,fill=gt@cyan!60,below=\x em of #1] {};
+  }
+}
+\def\bffillred(#1,#2,#3){
+  \foreach \x in {#2,...,#3}{
+    \node[draw,fill=gt@red!60,below=\x em of #1] {};
+  }
+}
+\begin{tikzpicture}[node distance=8ex]
+  \node[] (a) {\Huge Fail};
+  \node[right=of a] (b) {\Huge Fail};
+  \node[right=of b] (c) {\Huge Fail};
+  \node[right=of c] (d) {\Huge Fail};
+  \node[right=of d] (e) {\Huge Fail};
+  \node[right=of e] (f) {};
+  \node[below=12em of f] {\Huge \ldots{}};
+  \node[right=of f] (g) {\Huge Pass};
+  \node[right=of g] (h) {\Huge Fail};
+  \node[right=of h] (i) {};
+  \node[below=12em of i] {\Huge \ldots{}};
+  \node[right=of i] (j) {\Huge Pass};
+
+  \bffilllight(a,0,12);
+  \bffilldark(a,13,24);
+
+  \bffilldark(b,0,12);
+  \bffilllight(b,13,24);
+
+  \bffilllight(c,0,8);
+  \bffilldark(c,9,24);
+
+  \bffilldark(d,0,8);
+  \bffilllight(d,9,16);
+  \bffilldark(d,17,24);
+
+  \bffilldark(e,0,16);
+  \bffilllight(e,17,24);
+
+  %% ...
+
+  \bffilldark(g,0,11);
+  \bffillred(g,12,16);
+  \bffilldark(g,17,24);
+
+  \bffilldark(h,0,11);
+  \bffillred(h,12,16);
+  \bffilllight(h,17,20);
+  \bffilldark(h,21,24);
+
+  \bffilldark(j,0,2);
+  \bffillred(j,3,4);
+  \bffilldark(j,4,11);
+  \bffillred(j,12,16);
+  \bffilldark(j,17,21);
+  \bffillred(j,22,24);
+
+\end{tikzpicture}

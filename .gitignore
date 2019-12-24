@@ -1,3 +1,6 @@
 __pycache__
 *.pyc
 src/testing/limit
+
+README.html
+.search-reduce.pdf
