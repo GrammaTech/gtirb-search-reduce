@@ -1,5 +1,7 @@
+# Copyright (C) 2020 GrammaTech, Inc.
+#
 # Large parts copied from block_remove.py in the rewriting/gtirb-reduce repo
-
+#
 import logging as log
 
 from gtirb import *

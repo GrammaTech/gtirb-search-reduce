@@ -1,3 +1,4 @@
+// Copyright (C) 2020 GrammaTech, Inc.
 #include <errno.h>
 #include <signal.h>
 #include <stdio.h>

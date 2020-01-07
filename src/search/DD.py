@@ -1,4 +1,5 @@
 #! /usr/bin/env python3
+# Copyright (C) 2020 GrammaTech, Inc.
 
 # Enhanced Delta Debugging class
 # Updated to Python 3.6 by Jeremy Lacomis, 2019

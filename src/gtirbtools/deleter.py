@@ -1,3 +1,4 @@
+# Copyright (C) 2020 GrammaTech, Inc.
 import logging as log
 import pickle
 import tempfile

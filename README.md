@@ -18,3 +18,12 @@ required functions is found, then the minimum set of basic blocks
 within each of these functions is found.  This is a speculative
 transformation which is able to achieve very significant reduction in
 program size but will likely break untested program behavior.
+
+
+## Acknowledgment
+
+This project is sponsored by the Office of Naval Research, One Liberty
+Center, 875 N. Randolph Street, Arlington, VA 22203 under contract #
+N68335-17-C-0700.  The content of the information does not necessarily
+reflect the position or policy of the Government and no official
+endorsement should be inferred.

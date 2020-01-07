@@ -1,3 +1,4 @@
+# Copyright (C) 2020 GrammaTech, Inc.
 from enum import Enum
 import logging as log
 import os
