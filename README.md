@@ -1,6 +1,8 @@
 Search-reduce
 =============
 
+TRL: 4
+
 Reduce a binary to only retain that which is required to continue to
 pass a provided test suite.
 
